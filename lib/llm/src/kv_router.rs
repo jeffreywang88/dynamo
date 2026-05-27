@@ -1153,7 +1153,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use async_trait::async_trait;
     use dynamo_kv_router::{
@@ -1553,5 +1553,80 @@ mod tests {
             assert_eq!(worker.shared_beyond_device_blocks, Some(2));
             assert!((worker.router_credit_blocks - 1.0).abs() < f64::EPSILON);
         }
+    }
+
+    fn load(
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+        potential_prefill_tokens: usize,
+        potential_decode_blocks: usize,
+    ) -> PotentialLoad {
+        PotentialLoad {
+            worker_id,
+            dp_rank,
+            potential_prefill_tokens,
+            potential_decode_blocks,
+        }
+    }
+
+    fn cache_hit_estimates(
+        entries: impl IntoIterator<Item = (WorkerWithDpRank, f64, usize)>,
+    ) -> CacheHitEstimates {
+        let mut effective_overlap_blocks = HashMap::new();
+        let mut cached_tokens = HashMap::new();
+        for (worker, overlap_blocks, tokens) in entries {
+            effective_overlap_blocks.insert(worker, overlap_blocks);
+            cached_tokens.insert(worker, tokens);
+        }
+        CacheHitEstimates {
+            effective_overlap_blocks,
+            cached_tokens,
+        }
+    }
+
+    #[test]
+    fn rank_potential_loads_orders_by_score_and_filters_allowed_workers() {
+        let estimates = cache_hit_estimates([
+            (WorkerWithDpRank::new(1, 0), 4.0, 16),
+            (WorkerWithDpRank::new(2, 0), 7.0, 28),
+            (WorkerWithDpRank::new(3, 0), 1.0, 4),
+        ]);
+
+        let ranked = rank_potential_loads(
+            vec![load(1, 0, 32, 4), load(2, 0, 8, 2), load(3, 0, 4, 0)],
+            &estimates,
+            4,
+            1.0,
+            Some(&HashSet::from([1, 2])),
+        );
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].worker_id, 2);
+        assert_eq!(ranked[0].overlap_blocks, 7);
+        assert_eq!(ranked[0].potential_prefill_tokens, 8);
+        assert_eq!(ranked[0].potential_decode_blocks, 2);
+        assert_eq!(ranked[0].score, 4.0);
+        assert_eq!(ranked[1].worker_id, 1);
+        assert_eq!(ranked[1].score, 12.0);
+    }
+
+    #[test]
+    fn rank_potential_loads_is_deterministic_on_score_ties() {
+        let estimates = cache_hit_estimates([]);
+        let ranked = rank_potential_loads(
+            vec![load(9, 0, 4, 1), load(3, 0, 4, 1), load(3, 1, 4, 1)],
+            &estimates,
+            4,
+            1.0,
+            None,
+        );
+
+        assert_eq!(
+            ranked
+                .into_iter()
+                .map(|worker| (worker.worker_id, worker.dp_rank))
+                .collect::<Vec<_>>(),
+            vec![(3, 0), (3, 1), (9, 0)]
+        );
     }
 }
