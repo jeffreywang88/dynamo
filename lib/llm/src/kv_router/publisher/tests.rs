@@ -14,6 +14,16 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[test]
+fn resolve_worker_id_uses_explicit_worker_when_provided() {
+    assert_eq!(resolve_worker_id(17, Some(42)), 42);
+}
+
+#[test]
+fn resolve_worker_id_falls_back_to_connection_id() {
+    assert_eq!(resolve_worker_id(17, None), 17);
+}
+
 #[cfg(test)]
 mod test_event_processing {
     use super::*;
