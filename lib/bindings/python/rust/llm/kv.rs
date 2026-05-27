@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use pythonize::{depythonize, pythonize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -34,6 +34,10 @@ use super::entrypoint::AicPerfConfig;
 
 fn depythonize_block_mm_infos(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Option<BlockExtraInfo>>> {
     depythonize(obj).map_err(to_pyerr)
+}
+
+fn allowed_worker_set(allowed_worker_ids: Option<Vec<WorkerId>>) -> Option<HashSet<WorkerId>> {
+    allowed_worker_ids.map(|ids| ids.into_iter().collect())
 }
 
 #[cfg(feature = "kv-indexer")]
@@ -1094,7 +1098,7 @@ impl KvRouter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (token_ids, router_config_override=None, request_id=None, update_indexer=false, block_mm_infos=None, lora_name=None, routing_constraints=None))]
+    #[pyo3(signature = (token_ids, router_config_override=None, request_id=None, update_indexer=false, block_mm_infos=None, lora_name=None, routing_constraints=None, allowed_worker_ids=None))]
     fn best_worker<'p>(
         &self,
         py: Python<'p>,
@@ -1105,6 +1109,7 @@ impl KvRouter {
         block_mm_infos: Option<PyObject>,
         lora_name: Option<String>,
         routing_constraints: Option<RoutingConstraints>,
+        allowed_worker_ids: Option<Vec<WorkerId>>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let router_config_override = if let Some(obj) = router_config_override {
             let override_config: RouterConfigOverride =
@@ -1117,11 +1122,16 @@ impl KvRouter {
         let block_mm_infos = block_mm_infos
             .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
             .transpose()?;
+        let allowed_worker_ids = allowed_worker_set(allowed_worker_ids);
 
         let chooser = self.inner.chooser.clone();
         let update_states = request_id.is_some();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            if let Some(worker_ids) = allowed_worker_ids.as_ref() {
+                chooser.register_workers(worker_ids);
+            }
+
             let outcome = chooser
                 .find_best_match_details(
                     request_id.as_deref(),
@@ -1134,7 +1144,7 @@ impl KvRouter {
                     0.0,
                     None,
                     None,
-                    None, // allowed_worker_ids: pass via RoutingHints in PreprocessedRequest path
+                    allowed_worker_ids,
                     routing_constraints.map(Into::into).unwrap_or_default(),
                 )
                 .await
@@ -1195,6 +1205,108 @@ impl KvRouter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (token_ids, router_config_override=None, allowed_worker_ids=None, block_mm_infos=None, lora_name=None))]
+    fn rank_workers<'p>(
+        &self,
+        py: Python<'p>,
+        token_ids: Vec<u32>,
+        router_config_override: Option<PyObject>,
+        allowed_worker_ids: Option<Vec<WorkerId>>,
+        block_mm_infos: Option<PyObject>,
+        lora_name: Option<String>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let router_config_override = if let Some(obj) = router_config_override {
+            let override_config: RouterConfigOverride =
+                depythonize(obj.bind(py)).map_err(to_pyerr)?;
+            Some(override_config)
+        } else {
+            None
+        };
+
+        let block_mm_infos = block_mm_infos
+            .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
+            .transpose()?;
+        let allowed_worker_ids = allowed_worker_set(allowed_worker_ids);
+
+        let chooser = self.inner.chooser.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ranked = chooser
+                .rank_workers(
+                    &token_ids,
+                    block_mm_infos.as_deref(),
+                    router_config_override.as_ref(),
+                    lora_name,
+                    allowed_worker_ids,
+                )
+                .await
+                .map_err(to_pyerr)?;
+
+            Python::with_gil(|py| {
+                pythonize(py, &ranked)
+                    .map(|obj| obj.unbind())
+                    .map_err(to_pyerr)
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (request_id, token_ids, worker_id, dp_rank=0, overlap_blocks=0, expected_output_tokens=None, router_config_override=None, block_mm_infos=None, lora_name=None))]
+    fn add_request<'p>(
+        &self,
+        py: Python<'p>,
+        request_id: String,
+        token_ids: Vec<u32>,
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+        overlap_blocks: u32,
+        expected_output_tokens: Option<u32>,
+        router_config_override: Option<PyObject>,
+        block_mm_infos: Option<PyObject>,
+        lora_name: Option<String>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let router_config_override = if let Some(obj) = router_config_override {
+            let override_config: RouterConfigOverride =
+                depythonize(obj.bind(py)).map_err(to_pyerr)?;
+            Some(override_config)
+        } else {
+            None
+        };
+
+        let block_mm_infos = block_mm_infos
+            .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
+            .transpose()?;
+
+        let chooser = self.inner.chooser.clone();
+        let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let cached_tokens = (overlap_blocks as usize)
+                .saturating_mul(chooser.block_size() as usize)
+                .min(token_ids.len());
+            chooser
+                .add_request(
+                    request_id,
+                    &token_ids,
+                    block_mm_infos.as_deref(),
+                    cached_tokens,
+                    expected_output_tokens,
+                    worker,
+                    lora_name,
+                    router_config_override.as_ref(),
+                )
+                .await;
+            Ok::<(), pyo3::PyErr>(())
+        })
+    }
+
+    #[pyo3(signature = (worker_ids))]
+    fn register_workers(&self, worker_ids: Vec<WorkerId>) {
+        let worker_ids: HashSet<WorkerId> = worker_ids.into_iter().collect();
+        self.inner.chooser.register_workers(&worker_ids);
+    }
+
     /// Mark prefill as completed for a request
     fn mark_prefill_complete<'p>(
         &self,
@@ -1222,21 +1334,27 @@ impl KvRouter {
         })
     }
 
-    #[pyo3(signature = (token_ids, block_mm_infos=None, lora_name=None))]
+    #[pyo3(signature = (token_ids, block_mm_infos=None, lora_name=None, allowed_worker_ids=None))]
     fn get_potential_loads<'p>(
         &self,
         py: Python<'p>,
         token_ids: Vec<u32>,
         block_mm_infos: Option<PyObject>,
         lora_name: Option<String>,
+        allowed_worker_ids: Option<Vec<WorkerId>>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let block_mm_infos = block_mm_infos
             .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
             .transpose()?;
+        let allowed_worker_ids = allowed_worker_set(allowed_worker_ids);
         let chooser = self.inner.chooser.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let loads = chooser
+            if let Some(worker_ids) = allowed_worker_ids.as_ref() {
+                chooser.register_workers(worker_ids);
+            }
+
+            let mut loads = chooser
                 .get_potential_loads(
                     &token_ids,
                     None,
@@ -1245,6 +1363,9 @@ impl KvRouter {
                 )
                 .await
                 .map_err(to_pyerr)?;
+            if let Some(allowed_worker_ids) = allowed_worker_ids {
+                loads.retain(|load| allowed_worker_ids.contains(&load.worker_id));
+            }
 
             // Return loads without aggregation - each (worker_id, dp_rank) pair is a separate entry
             // Use pythonize to convert Vec<PotentialLoad> to Python list of dicts

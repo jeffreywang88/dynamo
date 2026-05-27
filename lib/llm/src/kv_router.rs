@@ -33,6 +33,7 @@ use dynamo_runtime::{
     traits::DistributedRuntimeProvider,
 };
 use futures::stream;
+use serde::Serialize;
 use tracing::Instrument;
 use validator::Validate;
 
@@ -89,6 +90,55 @@ pub enum FindBestMatchOutcome {
         queued_isl_tokens: usize,
         max_queued_isl_tokens: Option<usize>,
     },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RankedWorker {
+    pub worker_id: WorkerId,
+    pub dp_rank: DpRank,
+    pub overlap_blocks: u32,
+    pub potential_prefill_tokens: usize,
+    pub potential_decode_blocks: usize,
+    pub score: f64,
+}
+
+fn rank_potential_loads(
+    loads: Vec<PotentialLoad>,
+    cache_hit_estimates: &CacheHitEstimates,
+    block_size: u32,
+    prefill_load_scale: f64,
+    allowed_worker_ids: Option<&HashSet<WorkerId>>,
+) -> Vec<RankedWorker> {
+    let mut ranked: Vec<_> = loads
+        .into_iter()
+        .filter(|load| allowed_worker_ids.is_none_or(|allowed| allowed.contains(&load.worker_id)))
+        .map(|load| {
+            let worker = WorkerWithDpRank::new(load.worker_id, load.dp_rank);
+            let overlap_blocks =
+                cache_hit_for_worker(cache_hit_estimates, worker).rounded_overlap_blocks();
+            let potential_prefill_blocks =
+                (load.potential_prefill_tokens as f64) / (block_size as f64);
+            let score =
+                prefill_load_scale * potential_prefill_blocks + load.potential_decode_blocks as f64;
+
+            RankedWorker {
+                worker_id: load.worker_id,
+                dp_rank: load.dp_rank,
+                overlap_blocks,
+                potential_prefill_tokens: load.potential_prefill_tokens,
+                potential_decode_blocks: load.potential_decode_blocks,
+                score,
+            }
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| {
+        a.score
+            .total_cmp(&b.score)
+            .then_with(|| a.worker_id.cmp(&b.worker_id))
+            .then_with(|| a.dp_rank.cmp(&b.dp_rank))
+    });
+    ranked
 }
 
 // [gluo TODO] shouldn't need to be public
@@ -600,6 +650,57 @@ where
     /// Register externally-provided workers in the slot tracker.
     pub fn register_workers(&self, worker_ids: &HashSet<WorkerId>) {
         self.scheduler.register_workers(worker_ids);
+    }
+
+    pub async fn rank_workers(
+        &self,
+        tokens: &[u32],
+        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        router_config_override: Option<&RouterConfigOverride>,
+        lora_name: Option<String>,
+        allowed_worker_ids: Option<HashSet<WorkerId>>,
+    ) -> Result<Vec<RankedWorker>> {
+        if let Some(worker_ids) = allowed_worker_ids.as_ref() {
+            self.register_workers(worker_ids);
+        }
+
+        let hash_options = BlockHashOptions {
+            block_mm_infos,
+            lora_name: lora_name.as_deref(),
+            is_eagle: Some(self.is_eagle),
+        };
+        let block_hashes = compute_block_hash_for_seq(tokens, self.block_size, hash_options);
+        log_routing_input_hashes(None, self.block_size, tokens, &block_hashes);
+
+        let maybe_seq_hashes = self.kv_router_config.compute_seq_hashes_for_tracking(
+            tokens,
+            self.block_size,
+            router_config_override,
+            hash_options,
+            Some(&block_hashes),
+        );
+        let track_prefill_tokens = self
+            .kv_router_config
+            .track_prefill_tokens(router_config_override);
+        let tiered_matches = self.indexer.find_matches_by_tier(block_hashes).await?;
+        let cache_hit_estimates = self.cache_hit_estimates_from_tiered_matches(&tiered_matches);
+        let loads = self.scheduler.get_potential_loads(
+            maybe_seq_hashes,
+            tokens.len(),
+            cache_hit_estimates.cached_tokens.clone(),
+            track_prefill_tokens,
+        );
+        let prefill_load_scale = router_config_override
+            .and_then(|cfg| cfg.prefill_load_scale)
+            .unwrap_or(self.kv_router_config.prefill_load_scale);
+
+        Ok(rank_potential_loads(
+            loads,
+            &cache_hit_estimates,
+            self.block_size,
+            prefill_load_scale,
+            allowed_worker_ids.as_ref(),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -2362,6 +2362,7 @@ class KvRouter:
         block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
         lora_name: Optional[str] = None,
         routing_constraints: Optional[RoutingConstraints] = None,
+        allowed_worker_ids: Optional[List[int]] = None,
     ) -> Tuple[int, int, int]:
         """
         Find the best matching worker for the given tokens.
@@ -2379,6 +2380,11 @@ class KvRouter:
             block_mm_infos: Optional block-level multimodal metadata aligned to request
                            blocks. When provided, this is used in block hash computation
                            to enable MM-aware worker selection.
+            routing_constraints: Optional topology or taint constraints to apply while
+                                 selecting a worker.
+            allowed_worker_ids: Optional worker IDs to consider. If provided, routing is
+                                restricted to this set and the IDs are lazily
+                                registered for external/Ray-owned scoring.
 
         Returns:
             A tuple of (worker_id, dp_rank, overlap_blocks) where:
@@ -2388,11 +2394,76 @@ class KvRouter:
         """
         ...
 
+    async def rank_workers(
+        self,
+        token_ids: List[int],
+        router_config_override: Optional[JsonLike] = None,
+        allowed_worker_ids: Optional[List[int]] = None,
+        block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
+        lora_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Rank candidate workers for the given tokens without booking request state.
+
+        Args:
+            token_ids: List of token IDs to rank workers for.
+            router_config_override: Optional router configuration override.
+            allowed_worker_ids: Optional worker IDs to consider. If provided,
+                                ranking is restricted to this set and the IDs are
+                                lazily registered for external/Ray-owned scoring.
+            block_mm_infos: Optional block-level multimodal metadata aligned to
+                            request blocks.
+            lora_name: Optional LoRA adapter name used in block hash computation.
+
+        Returns:
+            A list of dictionaries sorted from best to worst. Each dictionary contains:
+                - worker_id: The worker ID
+                - dp_rank: The data parallel rank
+                - overlap_blocks: Number of matching cached blocks
+                - potential_prefill_tokens: Estimated prefill tokens if routed here
+                - potential_decode_blocks: Estimated active decode blocks
+                - score: Final router score, lower is better
+        """
+        ...
+
+    async def add_request(
+        self,
+        request_id: str,
+        token_ids: List[int],
+        worker_id: int,
+        dp_rank: int = 0,
+        overlap_blocks: int = 0,
+        expected_output_tokens: Optional[int] = None,
+        router_config_override: Optional[JsonLike] = None,
+        block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
+        lora_name: Optional[str] = None,
+    ) -> None:
+        """
+        Book a request in router load state after an external dispatcher accepts it.
+
+        This is the explicit lifecycle counterpart to query-only `best_worker()` or
+        `rank_workers()` calls. It should be paired with `mark_prefill_complete()`
+        and `free()`.
+        """
+        ...
+
+    def register_workers(self, worker_ids: List[int]) -> None:
+        """
+        Add externally-known workers to the router's active-load tracker.
+
+        This is additive and does not remove workers absent from `worker_ids`.
+        Ray or another external router remains the source of feasible replica
+        membership. If Dynamo already knows a worker's DP config it is reused;
+        otherwise the worker is treated as a single-rank cold worker.
+        """
+        ...
+
     async def get_potential_loads(
         self,
         token_ids: List[int],
         block_mm_infos: Optional[List[Optional[Dict[str, Any]]]] = None,
         lora_name: Optional[str] = None,
+        allowed_worker_ids: Optional[List[int]] = None,
     ) -> List[Dict[str, int]]:
         """
         Get potential prefill and decode loads for all workers.
@@ -2402,6 +2473,7 @@ class KvRouter:
             block_mm_infos: Optional block-level multimodal metadata aligned to request
                            blocks. When provided, this is used in hash computation
                            for MM-aware potential-load estimation.
+            allowed_worker_ids: Optional worker IDs to include in the returned load list.
 
         Returns:
             A list of dictionaries, each containing:

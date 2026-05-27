@@ -137,7 +137,9 @@ class StandaloneRouterHandler:
             }
             yield llm_engine_output
 
-    async def best_worker_id(self, token_ids, router_config_override=None):
+    async def best_worker_id(
+        self, token_ids, router_config_override=None, allowed_worker_ids=None
+    ):
         """
         Get the best worker ID for a given set of tokens without actually routing.
 
@@ -150,7 +152,9 @@ class StandaloneRouterHandler:
             raise RuntimeError("Router not initialized")
 
         (worker_id, _dp_rank, _overlap_blocks) = await self.kv_router.best_worker(
-            token_ids, router_config_override
+            token_ids,
+            router_config_override,
+            allowed_worker_ids=allowed_worker_ids,
         )
 
         yield worker_id
