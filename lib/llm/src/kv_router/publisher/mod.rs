@@ -64,6 +64,13 @@ fn create_kv_stream_name(component: &Component, subject: &str) -> String {
     .replace("_", "-")
 }
 
+fn resolve_worker_id(
+    default_worker_id: WorkerId,
+    explicit_worker_id: Option<WorkerId>,
+) -> WorkerId {
+    explicit_worker_id.unwrap_or(default_worker_id)
+}
+
 /// Configure the source of KV events.
 /// Currently, only ZMQ is supported.
 pub enum KvEventSourceConfig {
@@ -192,7 +199,7 @@ impl KvEventPublisher {
             .map(|ms| ms.min(MAX_BATCHING_TIMEOUT_MS));
 
         let (tx, rx) = mpsc::unbounded_channel::<PlacementEvent>();
-        let worker_id = worker_id.unwrap_or_else(|| component.drt().connection_id());
+        let worker_id = resolve_worker_id(component.drt().connection_id(), worker_id);
 
         let _ = KvPublisherMetrics::from_component(&component);
 
