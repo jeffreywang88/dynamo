@@ -199,6 +199,10 @@ where
     client: Client,
     is_eagle: bool,
     _served_indexer_handle: Option<ServedIndexerHandle>,
+    /// Recovery coordinator for the local-indexer event plane, when active.
+    /// Held so workers can be registered/removed directly — bypassing discovery
+    /// — via [`add_worker`](Self::add_worker) / [`remove_worker`](Self::remove_worker).
+    worker_query_client: Option<Arc<indexer::WorkerQueryClient>>,
     /// Optional external shared KV cache pool. When present, `find_best_match`
     /// queries it in parallel with the indexer and factors shared hits into scoring.
     shared_cache: Option<Box<dyn SharedKvCache>>,
@@ -273,18 +277,22 @@ where
         .await?;
 
         // Start KV event subscription if needed — skip when using a remote indexer.
-        if kv_router_config.use_remote_indexer {
+        // The event-plane subscriber returns a WorkerQueryClient handle so workers
+        // can be registered directly (see add_worker); other paths yield None.
+        let worker_query_client = if kv_router_config.use_remote_indexer {
             tracing::info!("Skipping KV event subscription (using remote indexer)");
+            None
         } else if kv_router_config.should_subscribe_to_kv_events() {
             indexer::start_subscriber(component.clone(), &kv_router_config, indexer.clone())
-                .await?;
+                .await?
         } else {
             tracing::info!(
                 "Skipping KV event subscription (use_kv_events={}, overlap_score_credit={})",
                 kv_router_config.use_kv_events,
                 kv_router_config.overlap_score_credit,
             );
-        }
+            None
+        };
 
         let served_indexer_handle = if kv_router_config.serve_indexer {
             let model_name = model_name.clone().ok_or_else(|| {
@@ -315,8 +323,28 @@ where
             client,
             is_eagle,
             _served_indexer_handle: served_indexer_handle,
+            worker_query_client,
             shared_cache,
         })
+    }
+
+    /// Register a worker directly with the local-indexer recovery coordinator
+    /// so its live KV events are indexed immediately, with no discovery-based
+    /// restore. Use this when the router already consumes the worker's full
+    /// event stream from the start. No-op when KV-event subscription is not
+    /// active (e.g. remote indexer or events disabled).
+    pub async fn add_worker(&self, worker_id: WorkerId) {
+        if let Some(client) = &self.worker_query_client {
+            client.add_worker(worker_id).await;
+        }
+    }
+
+    /// Remove a worker registered via [`add_worker`](Self::add_worker): evict
+    /// all of its blocks from the indexer. No-op when subscription is inactive.
+    pub async fn remove_worker(&self, worker_id: WorkerId) {
+        if let Some(client) = &self.worker_query_client {
+            client.remove_worker(worker_id).await;
+        }
     }
 
     /// Get a reference to the client used by this KvRouter

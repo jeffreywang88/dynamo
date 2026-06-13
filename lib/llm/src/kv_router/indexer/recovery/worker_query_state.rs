@@ -41,6 +41,17 @@ pub(super) struct RankState {
 }
 
 impl RankState {
+    /// A rank seeded to apply live events directly from the start, with no
+    /// discovery-based recovery. `InvalidatedByBarrier(None)` makes the first
+    /// observed event (any event_id) `FreshAfterBarrier`, i.e. applied
+    /// immediately, after which the cursor tracks contiguity as usual.
+    pub(super) fn direct() -> Self {
+        RankState {
+            cursor: CursorState::InvalidatedByBarrier(None),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn last_applied_id(&self) -> Option<u64> {
         self.cursor.last_applied_id()
     }
@@ -135,9 +146,31 @@ impl RankState {
 pub(super) struct WorkerState {
     pub(super) epoch: u64,
     pub(super) ranks: HashMap<DpRank, RankState>,
+    /// When set, this worker was registered directly (e.g. via `add_worker`)
+    /// rather than through discovery: its ranks are seeded to apply live
+    /// events immediately, never triggering a worker-query restore.
+    pub(super) direct: bool,
 }
 
 impl WorkerState {
+    /// Mark this worker as directly managed and (re)seed every rank to apply
+    /// live events from the start. Safe to call before or after events arrive.
+    pub(super) fn mark_direct(&mut self) {
+        self.direct = true;
+        for rank_state in self.ranks.values_mut() {
+            *rank_state = RankState::direct();
+        }
+    }
+
+    /// Get the rank's state, creating it on first use. Direct workers seed new
+    /// ranks to apply immediately; others start in `Initial` (restore-on-first).
+    fn rank_entry(&mut self, dp_rank: DpRank) -> &mut RankState {
+        let direct = self.direct;
+        self.ranks
+            .entry(dp_rank)
+            .or_insert_with(|| if direct { RankState::direct() } else { RankState::default() })
+    }
+
     pub(super) fn handle_discovered_rank(
         &mut self,
         dp_rank: DpRank,
@@ -176,7 +209,7 @@ impl WorkerState {
         let event_id = event.event.event_id;
 
         if matches!(&event.event.data, KvCacheEventData::Cleared) {
-            let rank_state = self.ranks.entry(dp_rank).or_default();
+            let rank_state = self.rank_entry(dp_rank);
             if rank_state
                 .last_applied_id()
                 .is_some_and(|last_applied_id| event_id <= last_applied_id)
@@ -188,7 +221,7 @@ impl WorkerState {
             return LiveEventAction::ApplyClear(event);
         }
 
-        let rank_state = self.ranks.entry(dp_rank).or_default();
+        let rank_state = self.rank_entry(dp_rank);
         match rank_state.cursor.observe(event_id) {
             CursorObservation::Stale { .. } => LiveEventAction::Ignore,
             observation if rank_state.recovery_inflight => {

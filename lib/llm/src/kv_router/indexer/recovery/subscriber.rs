@@ -4,6 +4,7 @@
 use super::worker_query::WorkerQueryClient;
 use crate::kv_router::Indexer;
 use anyhow::Result;
+use std::sync::Arc;
 use dynamo_kv_router::{
     config::KvRouterConfig,
     protocols::{KV_EVENT_SUBJECT, RouterEvent},
@@ -27,7 +28,7 @@ async fn start_kv_router_background_event_plane(
     component: Component,
     indexer: Indexer,
     transport_kind: EventTransportKind,
-) -> Result<()> {
+) -> Result<Option<Arc<WorkerQueryClient>>> {
     let cancellation_token = component.drt().primary_token();
 
     // Subscribe to KV events BEFORE spawning the discovery/recovery loop.
@@ -68,6 +69,9 @@ async fn start_kv_router_background_event_plane(
         }
     }
 
+    // The discovery loop owns the original handle; clone one for the event
+    // consumer and return one so the router can drive add_worker/remove_worker.
+    let consumer_client = worker_query_client.clone();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -100,7 +104,7 @@ async fn start_kv_router_background_event_plane(
                         event.event.dp_rank,
                         event.event.event_id
                     );
-                    worker_query_client.handle_live_event(event).await;
+                    consumer_client.handle_live_event(event).await;
                 }
             }
         }
@@ -108,7 +112,7 @@ async fn start_kv_router_background_event_plane(
         tracing::debug!("KV Router event plane background task exiting");
     });
 
-    Ok(())
+    Ok(Some(worker_query_client))
 }
 
 /// Helper to decide which subscriber (JetStream or Event Plane) to start based on config
@@ -116,7 +120,7 @@ pub async fn start_subscriber(
     component: Component,
     kv_router_config: &KvRouterConfig,
     indexer: Indexer,
-) -> Result<()> {
+) -> Result<Option<Arc<WorkerQueryClient>>> {
     let transport_kind = component.drt().default_event_transport_kind();
 
     // Start subscriber - durable_kv_events flag determines the mode:
@@ -141,7 +145,10 @@ pub async fn start_subscriber(
             indexer,
             kv_router_config,
         )
-        .await
+        .await?;
+        // JetStream path has no WorkerQueryClient; direct add_worker is
+        // unsupported there (it is only used with the local-indexer event plane).
+        Ok(None)
     } else {
         if transport_kind == EventTransportKind::Zmq {
             if kv_router_config.router_snapshot_threshold.is_some()

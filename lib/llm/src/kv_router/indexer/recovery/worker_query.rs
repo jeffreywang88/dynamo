@@ -160,6 +160,24 @@ impl WorkerQueryClient {
             .clone()
     }
 
+    /// Register a worker directly, bypassing discovery-based recovery.
+    ///
+    /// The worker's ranks are seeded to apply live KV events immediately (no
+    /// worker-query restore). Use this when the router already consumes the
+    /// worker's full event stream from the start, so there is nothing to
+    /// recover. Idempotent; safe to call before the worker's first event.
+    pub async fn add_worker(&self, worker_id: WorkerId) {
+        let worker_state = self.get_or_create_worker_state(worker_id);
+        worker_state.lock().await.mark_direct();
+    }
+
+    /// Remove a worker: drop its recovery state and evict all of its blocks
+    /// from the indexer. Inverse of [`add_worker`](Self::add_worker).
+    pub async fn remove_worker(&self, worker_id: WorkerId) {
+        self.worker_states.remove(&worker_id);
+        self.indexer.remove_worker(worker_id).await;
+    }
+
     fn query_target_for(&self, worker_id: WorkerId, dp_rank: DpRank) -> Option<Instance> {
         if let Some(target) = self.query_endpoints.target_for(worker_id, dp_rank) {
             return Some(target);
@@ -1974,5 +1992,62 @@ mod tests {
         kv_indexer.flush().await;
         let events = kv_indexer.dump_events().await.unwrap();
         assert_eq!(stored_block_hashes(&events), vec![13, 14, 15]);
+    }
+
+    // A worker registered via `add_worker` indexes its live events immediately,
+    // from the first event, with no discovery and no worker-query restore.
+    #[tokio::test]
+    async fn test_add_worker_applies_live_events_without_recovery() {
+        let (client, transport, kv_indexer) = make_test_client("direct-add-worker").await;
+        let key: RecoveryKey = (7, 0);
+
+        client.add_worker(key.0).await;
+
+        // The first event (id 0) is applied, not dropped as stale, and the
+        // contiguous follow-up applies directly — no restore is attempted.
+        client
+            .handle_live_event(make_store_event(key.0, key.1, 0))
+            .await;
+        client
+            .handle_live_event(make_store_event(key.0, key.1, 1))
+            .await;
+
+        assert_eq!(transport.call_count(), 0, "no worker-query recovery expected");
+        assert!(rank_state_matches(&client, key, |state| {
+            state.cursor == CursorState::Live(1)
+                && !state.recovery_inflight
+                && state.pending_live_events.is_empty()
+        }));
+
+        kv_indexer.flush().await;
+        let events = kv_indexer.dump_events().await.unwrap();
+        assert_eq!(stored_block_hashes(&events), vec![0, 1]);
+    }
+
+    // `remove_worker` drops recovery state and evicts the worker's blocks.
+    #[tokio::test]
+    async fn test_remove_worker_evicts_blocks_from_indexer() {
+        let (client, transport, kv_indexer) = make_test_client("direct-remove-worker").await;
+        let key: RecoveryKey = (9, 0);
+
+        client.add_worker(key.0).await;
+        client
+            .handle_live_event(make_store_event(key.0, key.1, 0))
+            .await;
+        kv_indexer.flush().await;
+        assert_eq!(transport.call_count(), 0);
+        assert_eq!(
+            stored_block_hashes(&kv_indexer.dump_events().await.unwrap()),
+            vec![0]
+        );
+
+        client.remove_worker(key.0).await;
+
+        assert!(client.worker_states.get(&key.0).is_none());
+        kv_indexer.flush().await;
+        assert!(
+            stored_block_hashes(&kv_indexer.dump_events().await.unwrap()).is_empty(),
+            "worker blocks should be evicted from the indexer"
+        );
     }
 }

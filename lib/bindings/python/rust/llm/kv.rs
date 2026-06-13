@@ -1373,4 +1373,28 @@ impl KvRouter {
             Ok(json_str)
         })
     }
+
+    /// Register a worker directly so its live KV events are indexed immediately,
+    /// bypassing discovery-based recovery. Use when the router already consumes
+    /// the worker's full event stream from the start. No-op if KV-event
+    /// subscription is not active. Pair with `remove_worker`.
+    fn add_worker<'p>(&self, py: Python<'p>, worker_id: WorkerId) -> PyResult<Bound<'p, PyAny>> {
+        let chooser = self.inner.chooser.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            chooser.add_worker(worker_id).await;
+            Ok(())
+        })
+    }
+
+    /// Remove a worker registered via `add_worker`, evicting its blocks from
+    /// the router's indexer. No-op if KV-event subscription is not active.
+    fn remove_worker<'p>(&self, py: Python<'p>, worker_id: WorkerId) -> PyResult<Bound<'p, PyAny>> {
+        let chooser = self.inner.chooser.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            chooser.remove_worker(worker_id).await;
+            Ok(())
+        })
+    }
 }
