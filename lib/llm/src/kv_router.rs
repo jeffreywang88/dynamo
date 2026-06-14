@@ -225,7 +225,12 @@ where
         model_name: Option<String>,
         is_eagle: bool,
         shared_cache: Option<Box<dyn SharedKvCache>>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        // Required because the scheduler retains a copy of the selector for
+        // query-only scoring (`select_among` / `KvRouter::select_worker`).
+        Sel: Clone,
+    {
         let kv_router_config = kv_router_config.unwrap_or_default();
         kv_router_config.validate()?;
         let component = endpoint.component();
@@ -623,6 +628,113 @@ where
                 "router backpressure: {reason:?} (queued_isl_tokens={queued_isl_tokens}, max_queued_isl_tokens={max_queued_isl_tokens:?})"
             )),
         }
+    }
+
+    /// Query-only candidate ranking: score the caller-provided
+    /// `allowed_worker_ids` by KV overlap + projected load and return the best,
+    /// WITHOUT going through `find_best_match_details` / the discovery-driven
+    /// scheduler queue.
+    ///
+    /// This shares the discovery-free overlap prologue with
+    /// [`find_best_match_details`](Self::find_best_match_details) (block-hash
+    /// computation, tiered-match lookup, tier/effective-overlap derivation) and
+    /// then calls [`KvScheduler::select_among`], which reuses the exact same
+    /// `DefaultWorkerSelector::select_worker` instance/config as the production
+    /// admission path (`admit_one`). Scoring is therefore identical; only the
+    /// candidate enumeration differs (caller-provided set vs. discovery watch).
+    ///
+    /// Returns `(worker, overlap_blocks, effective_overlap_blocks, cached_tokens)`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn select_worker(
+        &self,
+        context_id: Option<&str>,
+        tokens: &[u32],
+        allowed_worker_ids: &[u64],
+        router_config_override: Option<&RouterConfigOverride>,
+        block_mm_infos: Option<&[Option<BlockExtraInfo>]>,
+        lora_name: Option<String>,
+        routing_constraints: RoutingConstraints,
+    ) -> anyhow::Result<(WorkerWithDpRank, u32, f64, usize)>
+    where
+        Sel: Clone,
+    {
+        let isl_tokens = tokens.len();
+        if isl_tokens == 0 {
+            anyhow::bail!("select_worker requires a non-empty token sequence");
+        }
+        if allowed_worker_ids.is_empty() {
+            anyhow::bail!("select_worker requires at least one allowed worker id");
+        }
+
+        let hash_options = BlockHashOptions {
+            block_mm_infos,
+            lora_name: lora_name.as_deref(),
+            is_eagle: Some(self.is_eagle),
+        };
+
+        // ---- Discovery-free overlap prologue (mirrors find_best_match_details) ----
+        let block_hashes =
+            compute_block_hash_for_seq(tokens, self.block_size, hash_options);
+        log_routing_input_hashes(context_id, self.block_size, tokens, &block_hashes);
+        let maybe_seq_hashes = self.kv_router_config.compute_seq_hashes_for_tracking(
+            tokens,
+            self.block_size,
+            router_config_override,
+            hash_options,
+            Some(&block_hashes),
+        );
+
+        let TieredLookupResult {
+            tiered_matches, ..
+        } = query_tiered_matches(
+            &self.indexer,
+            self.shared_cache.as_deref(),
+            tokens,
+            self.block_size,
+            block_hashes,
+            false,
+        )
+        .await?;
+
+        let tier_overlap_blocks = tier_overlap_blocks_from_tiered_matches(&tiered_matches);
+        let cache_hit_estimates = self.cache_hit_estimates_from_tiered_matches(&tiered_matches);
+
+        let track_prefill_tokens = self
+            .kv_router_config
+            .track_prefill_tokens(router_config_override);
+
+        // The candidate set IS the allowed worker ids. dp_rank defaults to 0
+        // (ModelRuntimeConfig::default has data_parallel_size 1), matching how
+        // add_worker seeds these workers into the active-load slots.
+        let candidate_workers: HashMap<WorkerId, ModelRuntimeConfig> = allowed_worker_ids
+            .iter()
+            .map(|&id| (id, ModelRuntimeConfig::default()))
+            .collect();
+
+        let selection = self
+            .scheduler
+            .select_among(
+                maybe_seq_hashes,
+                isl_tokens,
+                tier_overlap_blocks,
+                cache_hit_estimates.effective_overlap_blocks,
+                cache_hit_estimates.cached_tokens,
+                &candidate_workers,
+                routing_constraints,
+                track_prefill_tokens,
+            )
+            .map_err(map_scheduler_error)?;
+
+        // Match the `overlap_blocks` derivation used by `find_best_match`:
+        // round the effective (weighted) overlap to a block count.
+        let overlap_blocks = selection.effective_overlap_blocks.round().max(0.0) as u32;
+
+        Ok((
+            selection.worker,
+            overlap_blocks,
+            selection.effective_overlap_blocks,
+            selection.cached_tokens,
+        ))
     }
 
     /// Register externally-provided workers in the slot tracker.
@@ -1154,6 +1266,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct InspectingSelector {
         expected_hits: Option<u32>,
         selected_worker: WorkerWithDpRank,
@@ -1182,6 +1295,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct OverloadedSelector;
 
     impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> for OverloadedSelector {
@@ -1209,12 +1323,17 @@ mod tests {
 
     async fn make_test_router(
         selector: impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>
+        + Clone
         + Send
         + Sync
         + 'static,
         shared_cache: Option<Box<dyn SharedKvCache>>,
     ) -> KvRouter<
-        impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig> + Send + Sync + 'static,
+        impl dynamo_kv_router::selector::WorkerSelector<ModelRuntimeConfig>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     > {
         let component = make_test_component("shared-cache-router").await;
         let endpoint = component.endpoint("backend");

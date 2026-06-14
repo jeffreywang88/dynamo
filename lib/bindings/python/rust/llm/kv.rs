@@ -1259,6 +1259,69 @@ impl KvRouter {
         })
     }
 
+    /// Query-only candidate ranking: pick the best worker among `allowed_worker_ids`
+    /// WITHOUT admitting the request into active-load tracking.
+    ///
+    /// Unlike `best_worker`, this never mutates scheduler state (`update_states=false`)
+    /// and constrains the decision to a caller-provided candidate set. Ray Serve calls
+    /// this to score its currently-routable replicas before HAProxy forwards the request;
+    /// active load is booked separately via `add_request` only after the request lands.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (request_id, token_ids, allowed_worker_ids, router_config_override=None, block_mm_infos=None, lora_name=None, routing_constraints=None))]
+    fn select_worker<'p>(
+        &self,
+        py: Python<'p>,
+        request_id: String,
+        token_ids: Vec<u32>,
+        allowed_worker_ids: Vec<u64>,
+        router_config_override: Option<PyObject>,
+        block_mm_infos: Option<PyObject>,
+        lora_name: Option<String>,
+        routing_constraints: Option<RoutingConstraints>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let router_config_override = if let Some(obj) = router_config_override {
+            let override_config: RouterConfigOverride =
+                depythonize(obj.bind(py)).map_err(to_pyerr)?;
+            Some(override_config)
+        } else {
+            None
+        };
+
+        let block_mm_infos = block_mm_infos
+            .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
+            .transpose()?;
+
+        let chooser = self.inner.chooser.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (worker, overlap_blocks, effective_overlap_blocks, cached_tokens) = chooser
+                .select_worker(
+                    Some(request_id.as_str()), // context_id: tracing only; no admission
+                    &token_ids,
+                    &allowed_worker_ids, // Ray's currently-routable replicas
+                    router_config_override.as_ref(),
+                    block_mm_infos.as_deref(),
+                    lora_name.clone(),
+                    routing_constraints.map(Into::into).unwrap_or_default(),
+                )
+                .await
+                .map_err(to_pyerr)?;
+
+            Python::with_gil(|py| {
+                let result = json!({
+                    "worker_id": worker.worker_id,
+                    "dp_rank": worker.dp_rank,
+                    "overlap_blocks": overlap_blocks,
+                    "effective_overlap_blocks": effective_overlap_blocks,
+                    "cached_tokens": cached_tokens,
+                });
+                pythonize(py, &result)
+                    .map(|obj| obj.unbind())
+                    .map_err(to_pyerr)
+            })
+        })
+    }
+
     /// Mark prefill as completed for a request
     fn mark_prefill_complete<'p>(
         &self,

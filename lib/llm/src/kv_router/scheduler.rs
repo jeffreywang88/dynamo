@@ -66,7 +66,12 @@ where
         overlap_scores_refresh: Option<Arc<RF>>,
         overloaded_worker_provider: Option<OverloadedWorkerProvider>,
         worker_type: &'static str,
-    ) -> Result<Self, KvSchedulerError> {
+    ) -> Result<Self, KvSchedulerError>
+    where
+        // Required because `LocalScheduler` retains a copy of the selector for
+        // query-only scoring (`select_among`).
+        Sel: Clone,
+    {
         let initial_workers: HashMap<WorkerId, ModelRuntimeConfig> =
             workers_with_configs.borrow().clone();
 
@@ -302,6 +307,37 @@ where
 
     pub fn get_active_lora_counts(&self) -> HashMap<String, usize> {
         self.inner.get_active_lora_counts()
+    }
+
+    /// Query-only candidate scoring; delegates to
+    /// [`LocalScheduler::select_among`]. Scores `candidate_workers` with the
+    /// exact same selector + load + eligibility as the production admission
+    /// path, without enqueuing or mutating any state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_among(
+        &self,
+        token_seq: Option<Vec<SequenceHash>>,
+        isl_tokens: usize,
+        tier_overlap_blocks: TierOverlapBlocks,
+        effective_overlap_blocks: HashMap<dynamo_kv_router::protocols::WorkerWithDpRank, f64>,
+        effective_cached_tokens: HashMap<dynamo_kv_router::protocols::WorkerWithDpRank, usize>,
+        candidate_workers: &HashMap<WorkerId, ModelRuntimeConfig>,
+        routing_constraints: RoutingConstraints,
+        track_prefill_tokens: bool,
+    ) -> Result<dynamo_kv_router::protocols::WorkerSelectionResult, KvSchedulerError>
+    where
+        Sel: Clone,
+    {
+        self.inner.select_among(
+            token_seq,
+            isl_tokens,
+            tier_overlap_blocks,
+            effective_overlap_blocks,
+            effective_cached_tokens,
+            candidate_workers,
+            routing_constraints,
+            track_prefill_tokens,
+        )
     }
 
     pub fn supports_overlap_refresh(&self) -> bool {

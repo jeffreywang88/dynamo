@@ -45,6 +45,15 @@ pub struct LocalScheduler<
     queue_updates: watch::Sender<()>,
     track_prefill_tokens_default: bool,
     worker_type: &'static str,
+    /// Copy of the selector used by the queue. Kept here so query-only paths
+    /// (`select_among`) can score caller-provided candidate sets with the exact
+    /// same config-driven logic as the production admission path (`admit_one`).
+    selector: Sel,
+    /// Block size, mirrored from the queue for the same reason.
+    block_size: u32,
+    /// Overload provider, mirrored from the queue so query-only eligibility
+    /// matches admission-time eligibility.
+    overloaded_worker_provider: Option<OverloadedWorkerProvider>,
 }
 
 impl<P, C, S, Sel, RF> LocalScheduler<P, C, S, Sel, RF>
@@ -85,7 +94,12 @@ where
         cancellation_token: CancellationToken,
         worker_type: &'static str,
         monitor_worker_configs: bool,
-    ) -> Self {
+    ) -> Self
+    where
+        // Required so a copy of the selector can be retained on the scheduler for
+        // query-only scoring (`select_among`) while the original moves into the queue.
+        Sel: Clone,
+    {
         if monitor_worker_configs {
             let slots_monitor = Arc::clone(&slots);
             let mut monitor_rx = workers_with_configs.clone();
@@ -119,6 +133,13 @@ where
                 }
             });
         }
+
+        // Keep copies of the data needed by query-only scoring (`select_among`)
+        // before moving the originals into the queue. Cloning the selector and
+        // overload provider guarantees the query path scores with the same
+        // config + eligibility as the admission path (`admit_one`).
+        let selector_for_query = selector.clone();
+        let overloaded_worker_provider_for_query = overloaded_worker_provider.clone();
 
         let queue = Arc::new(SchedulerQueue::new_with_overlap_refresh(
             Arc::clone(&slots),
@@ -183,6 +204,9 @@ where
             queue_updates,
             track_prefill_tokens_default,
             worker_type,
+            selector: selector_for_query,
+            block_size,
+            overloaded_worker_provider: overloaded_worker_provider_for_query,
         }
     }
 
@@ -389,6 +413,83 @@ where
     pub fn get_active_lora_counts(&self) -> HashMap<String, usize> {
         self.slots.get_active_lora_counts()
     }
+
+    /// Query-only candidate scoring.
+    ///
+    /// Scores `candidate_workers` by KV overlap + projected load and returns the
+    /// best, WITHOUT enqueuing the request or mutating any scheduler state. This
+    /// is the discovery-free analogue of [`admit_one`](super::queue) used by the
+    /// Ray / event-plane mode where the discovery watch is empty.
+    ///
+    /// Scoring is bit-identical to admission: it reuses the same `self.selector`
+    /// instance (so the same `KvRouterConfig`), computes `decode_blocks` /
+    /// `prefill_tokens` from `self.slots.potential_blocks_and_tokens_at` exactly
+    /// like `get_potential_loads` / `admit_one`, and derives eligibility via
+    /// `request.eligibility_with_overloaded(...)` with the same overload provider.
+    ///
+    /// `candidate_workers` IS the candidate set, so `allowed_worker_ids` is left
+    /// `None` on the synthesized request (the worker map already constrains it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_among(
+        &self,
+        token_seq: Option<Vec<SequenceHash>>,
+        isl_tokens: usize,
+        tier_overlap_blocks: TierOverlapBlocks,
+        effective_overlap_blocks: HashMap<WorkerWithDpRank, f64>,
+        effective_cached_tokens: HashMap<WorkerWithDpRank, usize>,
+        candidate_workers: &HashMap<WorkerId, C>,
+        routing_constraints: RoutingConstraints,
+        track_prefill_tokens: bool,
+    ) -> Result<crate::protocols::WorkerSelectionResult, KvSchedulerError>
+    where
+        Sel: Clone,
+    {
+        let decay_now = Instant::now();
+
+        // Build the request first, then project load through the SAME
+        // `SchedulingRequest::prefill_token_deltas()` + `potential_blocks_and_tokens_at`
+        // path the production `admit_one` uses, so the projected load — and thus the
+        // score — is identical (no re-derived delta logic that could drift).
+        let mut request = SchedulingRequest {
+            maybe_request_id: None,
+            token_seq,
+            isl_tokens,
+            tier_overlap_blocks,
+            effective_overlap_blocks,
+            effective_cached_tokens,
+            decode_blocks: FxHashMap::default(),
+            prefill_tokens: FxHashMap::default(),
+            track_prefill_tokens,
+            routing_constraints,
+            router_config_override: None,
+            update_states: false,
+            lora_name: None,
+            priority_jump: 0.0,
+            expected_output_tokens: None,
+            pinned_worker: None,
+            // candidate_workers IS the candidate set, so no further filtering.
+            allowed_worker_ids: None,
+            shared_cache_hits: None,
+            resp_tx: None,
+        };
+
+        let (decode_blocks, prefill_tokens) = self.slots.potential_blocks_and_tokens_at(
+            request.token_seq.as_deref(),
+            &request.prefill_token_deltas(),
+            decay_now,
+        );
+        request.decode_blocks = decode_blocks;
+        request.prefill_tokens = prefill_tokens;
+
+        let overloaded_worker_ids = self
+            .overloaded_worker_provider
+            .as_ref()
+            .and_then(|provider| provider());
+        let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+
+        self.selector
+            .select_worker(candidate_workers, &request, eligibility, self.block_size)
+    }
 }
 
 impl<P, C, S, Sel> LocalScheduler<P, C, S, Sel, NoopOverlapScoresRefresh>
@@ -414,7 +515,10 @@ where
         cancellation_token: CancellationToken,
         worker_type: &'static str,
         monitor_worker_configs: bool,
-    ) -> Self {
+    ) -> Self
+    where
+        Sel: Clone,
+    {
         Self::new_with_overload_provider(
             slots,
             workers_with_configs,
@@ -451,7 +555,10 @@ where
         cancellation_token: CancellationToken,
         worker_type: &'static str,
         monitor_worker_configs: bool,
-    ) -> Self {
+    ) -> Self
+    where
+        Sel: Clone,
+    {
         Self::new_with_overlap_refresh(
             slots,
             workers_with_configs,
@@ -487,7 +594,10 @@ where
         cancellation_token: CancellationToken,
         worker_type: &'static str,
         monitor_worker_configs: bool,
-    ) -> Self {
+    ) -> Self
+    where
+        Sel: Clone,
+    {
         Self::new(
             slots,
             workers_with_configs,
