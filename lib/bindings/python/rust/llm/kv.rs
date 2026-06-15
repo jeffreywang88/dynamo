@@ -1322,6 +1322,57 @@ impl KvRouter {
         })
     }
 
+    /// Admit a routed request into the active-load model on the chosen worker.
+    ///
+    /// Pairs 1:1 with a terminal `free`. `cached_tokens` is the worker's KV
+    /// overlap (leading prompt tokens already cached there) so the request's
+    /// counted prefill work excludes the reused prefix; `dp_rank` defaults to
+    /// the worker's sole rank.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (request_id, token_ids, worker_id, dp_rank=0, cached_tokens=0, expected_output_tokens=None, block_mm_infos=None, lora_name=None, router_config_override=None))]
+    fn add_request<'p>(
+        &self,
+        py: Python<'p>,
+        request_id: String,
+        token_ids: Vec<u32>,
+        worker_id: WorkerId,
+        dp_rank: DpRank,
+        cached_tokens: usize,
+        expected_output_tokens: Option<u32>,
+        block_mm_infos: Option<PyObject>,
+        lora_name: Option<String>,
+        router_config_override: Option<PyObject>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let router_config_override = if let Some(obj) = router_config_override {
+            let override_config: RouterConfigOverride =
+                depythonize(obj.bind(py)).map_err(to_pyerr)?;
+            Some(override_config)
+        } else {
+            None
+        };
+        let block_mm_infos = block_mm_infos
+            .map(|obj| depythonize_block_mm_infos(obj.bind(py)))
+            .transpose()?;
+        let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+        let chooser = self.inner.chooser.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            chooser
+                .add_request(
+                    request_id,
+                    &token_ids,
+                    block_mm_infos.as_deref(),
+                    cached_tokens,
+                    expected_output_tokens,
+                    worker,
+                    lora_name,
+                    router_config_override.as_ref(),
+                )
+                .await;
+            Ok(())
+        })
+    }
+
     /// Mark prefill as completed for a request
     fn mark_prefill_complete<'p>(
         &self,
@@ -1345,6 +1396,28 @@ impl KvRouter {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             chooser.free(&request_id).await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Account one newly generated KV block for a decoding request.
+    ///
+    /// Called once per output block boundary the request crosses.
+    /// `decay_fraction` weights the block by how much output is still expected
+    /// (`None` when no output-length estimate exists).
+    #[pyo3(signature = (request_id, decay_fraction=None))]
+    fn add_output_block<'p>(
+        &self,
+        py: Python<'p>,
+        request_id: String,
+        decay_fraction: Option<f64>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let chooser = self.inner.chooser.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            chooser
+                .add_output_block(&request_id, decay_fraction)
+                .map_err(to_pyerr)?;
             Ok(())
         })
     }
