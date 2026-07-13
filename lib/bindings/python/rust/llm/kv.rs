@@ -485,19 +485,51 @@ impl SelectionCacheConfig {
     }
 }
 
+/// Fused pre-routing preprocessor: parses an OpenAI chat-completions body,
+/// applies the model's chat template (minijinja), and tokenizes -- all in
+/// Rust, so prompt token ids never cross into Python.
+#[cfg(feature = "select-service")]
+struct ChatEncoder {
+    preprocessor: Arc<llm_rs::preprocessor::OpenAIPreprocessor>,
+}
+
+#[cfg(feature = "select-service")]
+impl ChatEncoder {
+    /// Build from a local HF checkout (config.json + tokenizer.json +
+    /// tokenizer_config.json), mirroring how the Dynamo frontend preprocesses.
+    fn new(model_path: &str) -> anyhow::Result<Self> {
+        let mdc = llm_rs::model_card::ModelDeploymentCard::load_from_disk(model_path, None)?;
+        let preprocessor = llm_rs::preprocessor::OpenAIPreprocessor::new(mdc)?;
+        Ok(Self { preprocessor })
+    }
+
+    fn render_encode(&self, body: &str) -> anyhow::Result<Vec<u32>> {
+        let request: llm_rs::protocols::openai::chat_completions::NvCreateChatCompletionRequest =
+            serde_json::from_str(body)?;
+        let prompt = self
+            .preprocessor
+            .apply_template(&request)?
+            .ok_or_else(|| anyhow::anyhow!("not a single-text chat request"))?;
+        let encoding = self.preprocessor.tokenize(&prompt)?;
+        Ok(encoding.token_ids().to_vec())
+    }
+}
+
 /// In-process handle to a managed Dynamo `SelectionService`.
 #[cfg(feature = "select-service")]
 #[pyclass]
 pub(crate) struct SelectionService {
     inner: Arc<RustSelectionService>,
+    chat_encoder: Option<Arc<ChatEncoder>>,
 }
 
 #[cfg(feature = "select-service")]
 #[pymethods]
 impl SelectionService {
     /// Create a selection service. `indexer_threads` sizes the KV indexer pool.
+    /// `model_path` (a local HF checkout) enables the fused `select_chat` path.
     #[new]
-    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None))]
+    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None, model_path = None))]
     fn new(
         py: Python<'_>,
         indexer_threads: usize,
@@ -505,6 +537,7 @@ impl SelectionService {
         replica_sync_port: Option<u16>,
         replica_sync_peers: Option<Vec<String>>,
         selection_cache: Option<SelectionCacheConfig>,
+        model_path: Option<String>,
     ) -> PyResult<Self> {
         let replica_sync_peers = replica_sync_peers.unwrap_or_default();
         if replica_sync_port.is_none() && !replica_sync_peers.is_empty() {
@@ -512,6 +545,13 @@ impl SelectionService {
                 "replica_sync_peers requires replica_sync_port",
             ));
         }
+        let chat_encoder = match model_path {
+            Some(path) => Some(Arc::new(
+                py.allow_threads(|| ChatEncoder::new(&path))
+                    .map_err(|e| PyValueError::new_err(format!("model_path: {e:#}")))?,
+            )),
+            None => None,
+        };
         let mut builder = SelectionServiceBuilder::new(kv_router_config_from_dynamo_env())
             .indexer_threads(indexer_threads)
             .indexer_peers(indexer_peers.unwrap_or_default())
@@ -524,6 +564,7 @@ impl SelectionService {
             .map_err(to_pyerr)?;
         Ok(Self {
             inner: Arc::new(inner),
+            chat_encoder,
         })
     }
 
@@ -631,6 +672,59 @@ impl SelectionService {
             let resp = core.select(req).await.map_err(selection_to_pyerr)?;
             Python::with_gil(|py| pythonize(py, &resp).map(|o| o.unbind()).map_err(to_pyerr))
         })
+    }
+
+    /// Fused select: parse the chat body + apply the chat template + tokenize
+    /// + select, entirely in Rust, so token ids never enter Python. `request`
+    /// is a `SelectRequest`-shaped dict with `body` (the raw chat-completions
+    /// JSON string) in place of `token_ids`. The response is `select`'s dict
+    /// plus `token_count`. Requires `SelectionService(model_path=...)`.
+    fn select_chat<'p>(&self, py: Python<'p>, request: PyObject) -> PyResult<Bound<'p, PyAny>> {
+        let mut req: serde_json::Value =
+            depythonize(request.bind(py)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let body = match req.get_mut("body").map(serde_json::Value::take) {
+            Some(serde_json::Value::String(s)) => s,
+            _ => return Err(PyValueError::new_err("select_chat requires a string `body`")),
+        };
+        req.as_object_mut().map(|o| o.remove("body"));
+        let Some(encoder) = self.chat_encoder.clone() else {
+            return Err(PyValueError::new_err(
+                "select_chat requires SelectionService(model_path=...)",
+            ));
+        };
+        let core = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Render + encode are CPU-bound (ms for multi-thousand-token
+            // prompts) -- run on the blocking pool, off the runtime workers.
+            let ids = tokio::task::spawn_blocking(move || encoder.render_encode(&body))
+                .await
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+                .map_err(|e| PyValueError::new_err(format!("fused render+encode: {e:#}")))?;
+            let token_count = ids.len();
+            req["token_ids"] = serde_json::Value::from(ids);
+            let select_req: SelectRequest = serde_json::from_value(req)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let resp = core.select(select_req).await.map_err(selection_to_pyerr)?;
+            Python::with_gil(|py| {
+                let obj = pythonize(py, &resp).map_err(to_pyerr)?;
+                obj.downcast::<pyo3::types::PyDict>()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?
+                    .set_item("token_count", token_count)?;
+                Ok(obj.unbind())
+            })
+        })
+    }
+
+    /// Test helper: the fused render+encode alone, returning token ids.
+    /// Production routing uses `select_chat`, which keeps ids in Rust.
+    fn tokenize_chat(&self, py: Python<'_>, body: String) -> PyResult<Vec<u32>> {
+        let Some(encoder) = self.chat_encoder.clone() else {
+            return Err(PyValueError::new_err(
+                "tokenize_chat requires SelectionService(model_path=...)",
+            ));
+        };
+        py.allow_threads(move || encoder.render_encode(&body))
+            .map_err(|e| PyValueError::new_err(format!("{e:#}")))
     }
 
     /// Select the best worker and book its load (dict, see `SelectAndReserveRequest`).
