@@ -521,6 +521,9 @@ impl ChatEncoder {
 pub(crate) struct SelectionService {
     inner: Arc<RustSelectionService>,
     chat_encoder: Option<Arc<ChatEncoder>>,
+    // Bounds concurrent fused render+encode jobs; None = demand-grown
+    // (tokio blocking pool). Experimental knob for admission studies.
+    fused_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[cfg(feature = "select-service")]
@@ -529,7 +532,7 @@ impl SelectionService {
     /// Create a selection service. `indexer_threads` sizes the KV indexer pool.
     /// `model_path` (a local HF checkout) enables the fused `select_chat` path.
     #[new]
-    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None, model_path = None))]
+    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None, model_path = None, fused_threads = None))]
     fn new(
         py: Python<'_>,
         indexer_threads: usize,
@@ -538,6 +541,7 @@ impl SelectionService {
         replica_sync_peers: Option<Vec<String>>,
         selection_cache: Option<SelectionCacheConfig>,
         model_path: Option<String>,
+        fused_threads: Option<usize>,
     ) -> PyResult<Self> {
         let replica_sync_peers = replica_sync_peers.unwrap_or_default();
         if replica_sync_port.is_none() && !replica_sync_peers.is_empty() {
@@ -565,6 +569,8 @@ impl SelectionService {
         Ok(Self {
             inner: Arc::new(inner),
             chat_encoder,
+            fused_permits: fused_threads
+                .map(|n| Arc::new(tokio::sync::Semaphore::new(n.max(1)))),
         })
     }
 
@@ -693,13 +699,25 @@ impl SelectionService {
             ));
         };
         let core = self.inner.clone();
+        let permits = self.fused_permits.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Render + encode are CPU-bound (ms for multi-thousand-token
             // prompts) -- run on the blocking pool, off the runtime workers.
+            // `fused_threads` bounds how many run concurrently.
+            let permit = match &permits {
+                Some(sem) => Some(
+                    sem.clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?,
+                ),
+                None => None,
+            };
             let ids = tokio::task::spawn_blocking(move || encoder.render_encode(&body))
                 .await
                 .map_err(|e| PyValueError::new_err(e.to_string()))?
                 .map_err(|e| PyValueError::new_err(format!("fused render+encode: {e:#}")))?;
+            drop(permit);
             let token_count = ids.len();
             req["token_ids"] = serde_json::Value::from(ids);
             let select_req: SelectRequest = serde_json::from_value(req)
