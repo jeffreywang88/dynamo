@@ -524,6 +524,42 @@ pub(crate) struct SelectionService {
     // Bounds concurrent fused render+encode jobs; None = demand-grown
     // (tokio blocking pool). Experimental knob for admission studies.
     fused_permits: Option<Arc<tokio::sync::Semaphore>>,
+    // Token forwarding: prompt ids computed by select_chat, keyed by
+    // selection_id, so the serving replica can skip re-tokenization.
+    // FIFO-bounded; non-destructive reads (booking replay is independent).
+    pending_tokens: Arc<std::sync::Mutex<PendingTokens>>,
+}
+
+/// FIFO-bounded selection_id -> prompt token ids map for token forwarding.
+struct PendingTokens {
+    order: std::collections::VecDeque<String>,
+    map: HashMap<String, Vec<u32>>,
+    cap: usize,
+}
+
+impl PendingTokens {
+    fn new(cap: usize) -> Self {
+        Self {
+            order: std::collections::VecDeque::new(),
+            map: HashMap::new(),
+            cap,
+        }
+    }
+
+    fn insert(&mut self, key: String, ids: Vec<u32>) {
+        if self.map.insert(key.clone(), ids).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u32>> {
+        self.map.get(key).cloned()
+    }
 }
 
 #[cfg(feature = "select-service")]
@@ -571,7 +607,14 @@ impl SelectionService {
             chat_encoder,
             fused_permits: fused_threads
                 .map(|n| Arc::new(tokio::sync::Semaphore::new(n.max(1)))),
+            pending_tokens: Arc::new(std::sync::Mutex::new(PendingTokens::new(8192))),
         })
+    }
+
+    /// Token forwarding: prompt ids computed by the matching `select_chat`,
+    /// or None if unknown/evicted. Non-destructive (FIFO cap bounds memory).
+    fn get_prompt_tokens(&self, selection_id: String) -> Option<Vec<u32>> {
+        self.pending_tokens.lock().ok()?.get(&selection_id)
     }
 
     /// Stop the service: cancel KV-event listeners and scheduling so that
@@ -700,6 +743,11 @@ impl SelectionService {
         };
         let core = self.inner.clone();
         let permits = self.fused_permits.clone();
+        let pending_tokens = self.pending_tokens.clone();
+        let selection_id = req
+            .get("selection_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             // Render + encode are CPU-bound (ms for multi-thousand-token
             // prompts) -- run on the blocking pool, off the runtime workers.
@@ -719,6 +767,11 @@ impl SelectionService {
                 .map_err(|e| PyValueError::new_err(format!("fused render+encode: {e:#}")))?;
             drop(permit);
             let token_count = ids.len();
+            if let Some(sid) = selection_id {
+                if let Ok(mut pt) = pending_tokens.lock() {
+                    pt.insert(sid, ids.clone());
+                }
+            }
             req["token_ids"] = serde_json::Value::from(ids);
             let select_req: SelectRequest = serde_json::from_value(req)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
