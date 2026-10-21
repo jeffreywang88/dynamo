@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::WorkerSelectionPolicyFactory;
@@ -11,12 +12,13 @@ use crate::config::KvRouterConfig;
 use crate::protocols::WorkerId;
 use crate::scheduling::PotentialLoad;
 use crate::services::common::replica_sync::{
-    PeerManager, ReplicaPeerError, ReplicaSyncRuntime, setup_replica_sync,
+    AffinityBindingEvent, HostAffinityReplication, PeerManager, ReplicaPeerError,
+    ReplicaSyncRuntime, setup_replica_sync,
 };
 use crate::services::indexer::backend::IndexerPolicy;
 use crate::tracking_hash::TrackingHashContext;
 
-use super::affinity::SessionAffinityConfig;
+use super::affinity::{ReplicaApplyOutcome, SessionAffinityConfig};
 use super::core::{KvIndexSource, SelectionCore, SelectionHost, SelectionServiceConfig};
 use super::error::SelectionError;
 use super::pending::SelectionCacheConfig;
@@ -40,6 +42,7 @@ pub struct SelectionServiceBuilder {
     host: SelectionHost,
     worker_selection_policy_factory: Option<WorkerSelectionPolicyFactory>,
     session_affinity_ttl: Option<Duration>,
+    session_replication_writer_id: Option<u64>,
     host_manages_request_lifecycle: bool,
 }
 
@@ -81,6 +84,7 @@ impl SelectionServiceBuilder {
             host: SelectionHost::default(),
             worker_selection_policy_factory: None,
             session_affinity_ttl: None,
+            session_replication_writer_id: None,
             host_manages_request_lifecycle: false,
         }
     }
@@ -125,6 +129,14 @@ impl SelectionServiceBuilder {
         self
     }
 
+    /// Export bindings through a bounded channel instead of the built-in mesh.
+    /// The host supplies an id unique to this replica incarnation and carries
+    /// both commit updates and release-time TTL refreshes to its peers.
+    pub fn session_binding_replication(mut self, writer_id: u64) -> Self {
+        self.session_replication_writer_id = Some(writer_id);
+        self
+    }
+
     pub fn replica_sync(mut self, port: u16, peers: Vec<String>) -> Self {
         self.replica_sync_port = Some(port);
         self.replica_sync_peers = peers;
@@ -146,6 +158,25 @@ impl SelectionServiceBuilder {
     }
 
     pub async fn build(mut self) -> anyhow::Result<SelectionService> {
+        let session_binding_rx = if let Some(writer_id) = self.session_replication_writer_id {
+            anyhow::ensure!(
+                self.session_affinity_ttl.is_some(),
+                "session binding replication requires session affinity"
+            );
+            anyhow::ensure!(
+                self.host.replication.affinity.is_none(),
+                "session binding publisher already configured"
+            );
+            let (publisher, rx) = HostAffinityReplication::channel(writer_id);
+            self.host.replication.affinity = Some(publisher);
+            Some(rx)
+        } else {
+            None
+        };
+        anyhow::ensure!(
+            self.replica_sync_port.is_none() || self.host.replication.affinity.is_none(),
+            "host session binding replication cannot be combined with replica_sync"
+        );
         self.kv_router_config
             .apply_policy_config()
             .map_err(anyhow::Error::msg)?;
@@ -241,6 +272,7 @@ impl SelectionServiceBuilder {
         startup_guard.disarm();
         Ok(SelectionService {
             core,
+            session_binding_rx: parking_lot::Mutex::new(session_binding_rx),
             peer_manager,
             replica_runtime,
             replica_sync_port: self.replica_sync_port,
@@ -301,13 +333,53 @@ impl Drop for StartupGuard {
 
 pub struct SelectionService {
     core: Arc<SelectionCore>,
+    session_binding_rx: parking_lot::Mutex<Option<mpsc::Receiver<AffinityBindingEvent>>>,
     peer_manager: Option<Arc<PeerManager>>,
     replica_runtime: Option<ReplicaSyncRuntime>,
     replica_sync_port: Option<u16>,
     cancel_token: CancellationToken,
 }
 
+/// Single-consumer stream that terminates when the service shuts down.
+pub struct SessionBindingUpdates {
+    rx: mpsc::Receiver<AffinityBindingEvent>,
+    cancel_token: CancellationToken,
+}
+
+impl SessionBindingUpdates {
+    pub async fn recv(&mut self) -> Option<AffinityBindingEvent> {
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => None,
+            event = self.rx.recv() => event,
+        }
+    }
+}
+
 impl SelectionService {
+    /// Take the single-consumer binding stream configured by the host.
+    pub fn take_session_binding_updates(&self) -> Result<SessionBindingUpdates, SelectionError> {
+        let rx = self.session_binding_rx.lock().take().ok_or_else(|| {
+            SelectionError::Conflict(
+                "session binding stream is disabled or already taken".to_string(),
+            )
+        })?;
+        Ok(SessionBindingUpdates {
+            rx,
+            cancel_token: self.cancel_token.clone(),
+        })
+    }
+
+    /// Reconcile a peer binding independently of request load. Importing does
+    /// not publish an update; membership lag is returned to the host for retry.
+    pub fn apply_session_binding(
+        &self,
+        binding: AffinityBindingEvent,
+    ) -> Result<ReplicaApplyOutcome, SelectionError> {
+        self.core.ensure_running()?;
+        Ok(self.core.dispatch_affinity_event(binding))
+    }
+
     #[cfg(test)]
     pub(super) fn new_local_for_test(
         kv_router_config: KvRouterConfig,
@@ -315,6 +387,7 @@ impl SelectionService {
     ) -> Self {
         let cancel_token = CancellationToken::new();
         Self {
+            session_binding_rx: parking_lot::Mutex::new(None),
             core: Arc::new(
                 SelectionCore::try_new_local(
                     kv_router_config,

@@ -42,6 +42,8 @@
 //!   (`dropped_selection_future_frees_its_booking`,
 //!   `dropped_book_selection_during_routing_record_frees_booking_and_claim`).
 
+use std::collections::HashSet;
+
 use super::super::affinity::{SessionAffinityMode, validate_dispatch_target};
 use super::hint::{hint_capable_partition, transfer_hint_for_selection};
 
@@ -306,7 +308,9 @@ impl SelectionCore {
         };
         let affinity_target = match (&session, table) {
             (SessionBinding::Managed { session_id }, Some(table)) => {
-                affinity_hold = self.hold_session(table, session_id, &key).await?;
+                affinity_hold = self
+                    .hold_session(table, session_id, &key, allowed_worker_ids.as_ref())
+                    .await?;
                 affinity_hold.as_ref().and_then(Hold::target)
             }
             (SessionBinding::Query { session_id }, Some(table)) => table
@@ -566,24 +570,27 @@ impl SelectionCore {
     }
 
     /// Hold `session_id` for a booking, re-initializing a binding whose target
-    /// this partition can no longer schedule. `None` when the table is full: a
+    /// this request can no longer schedule. `None` when the table is full: a
     /// router-side limit, not a client fault, so the request routes unpinned.
     pub(super) async fn hold_session(
         &self,
         table: &SessionAffinity,
         session_id: &str,
         key: &RoutingPartitionId,
+        allowed_worker_ids: Option<&HashSet<WorkerId>>,
     ) -> Result<Option<Hold>, SelectionError> {
         let mut invalidations = 0;
         loop {
             match table.acquire(session_id, None).await {
                 Ok(Hold::Bound { target, mut lease })
-                    if !self.catalog.is_schedulable(target, key) =>
+                    if !self.catalog.is_schedulable(target, key)
+                        || allowed_worker_ids
+                            .is_some_and(|ids| !ids.contains(&target.worker_id)) =>
                 {
                     tracing::debug!(
                         session_id,
                         worker_id = target.worker_id,
-                        "Session affinity target is not schedulable; re-initializing"
+                        "Session affinity target is unavailable or excluded; re-initializing"
                     );
                     lease.invalidate();
                     drop(lease);
