@@ -37,7 +37,7 @@ const AFFINITY_EVENT_CHANNEL_CAPACITY: usize = 4_096;
 
 /// One replicated session binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AffinityBindingEvent {
+pub struct AffinityBindingEvent {
     #[serde(flatten)]
     pub partition: RoutingPartitionId,
     pub session_id: String,
@@ -63,14 +63,14 @@ impl AffinityBindingEvent {
 
 #[cfg(feature = "standalone-selection")]
 /// Publishes bindings from a [`super::super::selection::affinity::SessionAffinity`]
-/// into the mesh. Best effort: a full channel drops the update.
-struct AffinityMeshSink {
-    partition: RoutingPartitionId,
-    tx: mpsc::Sender<AffinityBindingEvent>,
+/// into a transport channel. Best effort: a full channel drops the update.
+pub(crate) struct AffinityMeshSink<T> {
+    pub(crate) partition: RoutingPartitionId,
+    pub(crate) tx: flume::Sender<T>,
 }
 
 #[cfg(feature = "standalone-selection")]
-impl AffinityReplicaSink for AffinityMeshSink {
+impl<T: From<AffinityBindingEvent> + Send + Sync> AffinityReplicaSink for AffinityMeshSink<T> {
     fn publish(&self, session_id: &str, target: AffinityTarget, version: AffinityVersion) {
         let update = AffinityBindingEvent {
             partition: self.partition.clone(),
@@ -80,7 +80,7 @@ impl AffinityReplicaSink for AffinityMeshSink {
             sequence: version.sequence,
             writer_id: version.writer_id,
         };
-        if let Err(error) = self.tx.try_send(update) {
+        if let Err(error) = self.tx.try_send(update.into()) {
             tracing::trace!(%error, "dropping best-effort session affinity replica update");
         }
     }
@@ -114,7 +114,7 @@ pub(crate) type ReplicaEventSender = mpsc::Sender<ScopedReplicaEvent>;
 pub(crate) struct ReplicaSyncConfig {
     process_id: u64,
     outbound_tx: ReplicaEventSender,
-    affinity_tx: Option<mpsc::Sender<AffinityBindingEvent>>,
+    affinity_tx: Option<flume::Sender<AffinityBindingEvent>>,
     cancel_token: CancellationToken,
 }
 
@@ -166,7 +166,7 @@ impl ReplicaSyncConfig {
         }
     }
 
-    fn with_affinity_publisher(mut self, tx: mpsc::Sender<AffinityBindingEvent>) -> Self {
+    fn with_affinity_publisher(mut self, tx: flume::Sender<AffinityBindingEvent>) -> Self {
         self.affinity_tx = Some(tx);
         self
     }
@@ -504,15 +504,14 @@ pub(crate) fn start_replica_publisher(
     cancel_token: CancellationToken,
 ) -> Result<(
     ReplicaEventSender,
-    mpsc::Sender<AffinityBindingEvent>,
+    flume::Sender<AffinityBindingEvent>,
     JoinHandle<()>,
 )> {
     validate_endpoint(bind_endpoint)?;
     let mut socket = create_bound_pub_socket(bind_endpoint)
         .with_context(|| format!("failed to bind replica publisher to `{bind_endpoint}`"))?;
     let (tx, mut rx) = mpsc::channel::<ScopedReplicaEvent>(REPLICA_EVENT_CHANNEL_CAPACITY);
-    let (affinity_tx, mut affinity_rx) =
-        mpsc::channel::<AffinityBindingEvent>(AFFINITY_EVENT_CHANNEL_CAPACITY);
+    let (affinity_tx, affinity_rx) = flume::bounded(AFFINITY_EVENT_CHANNEL_CAPACITY);
 
     let task = tokio::spawn(async move {
         // The two sources close independently; keep publishing until both are
@@ -529,9 +528,9 @@ pub(crate) fn start_replica_publisher(
                         continue;
                     }
                 },
-                binding = affinity_rx.recv(), if affinity_open => match binding {
-                    Some(binding) => OutboundReplicaMessage::Affinity(binding),
-                    None => {
+                binding = affinity_rx.recv_async(), if affinity_open => match binding {
+                    Ok(binding) => OutboundReplicaMessage::Affinity(binding),
+                    Err(_) => {
                         affinity_open = false;
                         continue;
                     }

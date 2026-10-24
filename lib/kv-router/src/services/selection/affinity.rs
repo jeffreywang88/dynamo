@@ -44,6 +44,7 @@ pub fn subagent_group_affinity_id(parent_session_id: &str) -> String {
 #[serde(rename_all = "lowercase")]
 pub enum SessionAffinityMode {
     /// The binding is exact: dispatching to another worker or rank is an error.
+    /// Hosts may invalidate an unavailable target before reselecting.
     #[default]
     Hard,
     /// The binding follows the dispatch: the session rebinds to where it ran.
@@ -86,8 +87,10 @@ pub trait AffinityReplicaSink: Send + Sync {
     fn publish(&self, session_id: &str, target: AffinityTarget, version: AffinityVersion);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReplicaApplyOutcome {
+    Applied,
     Inserted,
     Refreshed,
     ReplacedExpired,
@@ -96,6 +99,10 @@ pub enum ReplicaApplyOutcome {
     IgnoredConflict,
     RejectedSessionId,
     RejectedCapacity,
+    UnknownPartition,
+    AffinityDisabled,
+    UnknownWorker,
+    IgnoredSelf,
 }
 
 enum AffinityEntry {

@@ -44,6 +44,19 @@ fn app() -> Router {
     create_router(Arc::new(AppState { service }))
 }
 
+#[tokio::test]
+async fn host_replica_stream_requires_exclusive_transport() {
+    let builder = SelectionServiceBuilder::new(
+        test_config(),
+        crate::WorkerType::Aggregated,
+        RouterPluginRegistry::default(),
+    )
+    .replication(11)
+    .replica_sync(0, Vec::new());
+    let error = builder.build().await.err().expect("conflicting transports");
+    assert!(error.to_string().contains("cannot be combined"));
+}
+
 struct WorkerIdScorer;
 
 impl WorkerScorer for WorkerIdScorer {

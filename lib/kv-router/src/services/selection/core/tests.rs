@@ -1475,7 +1475,7 @@ async fn lease_admission_installs_no_index_row_and_records_nothing() {
 
 #[tokio::test]
 async fn dropped_selection_future_frees_its_booking() {
-    let core = local_core(test_config(false));
+    let (core, updates) = core_with_binding_stream(11);
     core.upsert_worker(worker(1)).await.expect("worker upsert");
     let key = default_key();
     let entry = core.entry(&key).expect("entry");
@@ -1509,6 +1509,10 @@ async fn dropped_selection_future_frees_its_booking() {
     })
     .await;
     assert!(core.reservation_index.read().get("dropped").is_none());
+    assert!(
+        updates.try_recv().is_err(),
+        "cancelled bookings must not be exported"
+    );
 }
 
 #[rstest::rstest]
@@ -1657,8 +1661,11 @@ async fn shutdown_interrupts_indexer_waits(
 /// session commit) and the index install; the armed lease, not lock
 /// discipline, covers it. Dropping the run there frees the booking and
 /// releases the id claim.
+#[rstest::rstest]
+#[case::atomic(false)]
+#[case::split(true)]
 #[tokio::test]
-async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() {
+async fn dropped_book_selection_during_routing_record_frees_booking_and_claim(#[case] split: bool) {
     use crate::indexer::TieredMatchDetails;
     use crate::services::indexer::backend::RemotePrimary;
     struct PausedRecord {
@@ -1702,9 +1709,11 @@ async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() 
         entered: AtomicBool::new(false),
         release: tokio::sync::Notify::new(),
     });
+    let (replication, updates) = HostReplication::channel(11);
     let core = core_with(
         test_config(false),
         SelectionHost {
+            replication,
             cache: HostCache {
                 index: KvIndexSource::Owned(Arc::new(PausedRecordIngress(record.clone()))),
                 shared: None,
@@ -1723,7 +1732,23 @@ async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() 
     let entry = core.entry(&key).expect("entry");
 
     // Poll by hand until the booking exists and the record is awaited.
-    let mut selection = Box::pin(core.select_and_reserve(session_reservation("recording", "s")));
+    if split {
+        let mut request = select_request();
+        request.selection_id = Some("recording".to_string());
+        request.session_id = Some("s".to_string());
+        core.select(request).await.unwrap();
+    }
+    let mut selection = Box::pin(async {
+        if split {
+            core.create_reservation(replay_reservation("recording"))
+                .await
+                .map(|_| ())
+        } else {
+            core.select_and_reserve(session_reservation("recording", "s"))
+                .await
+                .map(|_| ())
+        }
+    });
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     wait_until("routing record entered", || {
         if record.entered.load(Ordering::Acquire) {
@@ -1758,6 +1783,12 @@ async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() 
     assert!(
         core.reservation_index.read().get("recording").is_none(),
         "the claim is released with the booking"
+    );
+    assert!(
+        updates
+            .try_iter()
+            .all(|event| !matches!(event, ReplicaUpdate::Reservation(_))),
+        "a booking cancelled during recording must not be exported"
     );
 }
 
@@ -2880,7 +2911,7 @@ async fn joined_failover_preserves_the_successful_bookings_binding(#[case] commi
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
     let mut r2_request = session_reservation("r2", "s");
-    r2_request.allowed_worker_ids = Some(HashSet::from([replacement]));
+    r2_request.allowed_worker_ids = Some(HashSet::from([first.worker_id, replacement]));
     let mut r2 = Box::pin(core.select_and_reserve(r2_request));
     assert!(r2.as_mut().poll(&mut context).is_pending());
     core.catalog
@@ -2925,11 +2956,19 @@ async fn late_failover_mismatch_preserves_the_committed_replacement() {
     let key = default_key();
     let entry = core.entry(&key).expect("entry");
     let table = entry.affinity.get().expect("affinity table");
-    let old_hold = core.hold_session(table, "s", &key).await.unwrap().unwrap();
+    let old_hold = core
+        .hold_session(table, "s", &key, None)
+        .await
+        .unwrap()
+        .unwrap();
     core.catalog
         .set_lifecycle(first.worker_id, WorkerLifecycle::Draining, Vec::new());
     let replacement = if first.worker_id == 1 { 2 } else { 1 };
-    let new_hold = core.hold_session(table, "s", &key).await.unwrap().unwrap();
+    let new_hold = core
+        .hold_session(table, "s", &key, None)
+        .await
+        .unwrap()
+        .unwrap();
     let lease = core
         .commit_session(
             table,
@@ -3084,45 +3123,97 @@ async fn free_releases_reservation_and_affinity_without_actor_progress() {
         .expect("completed cleanup must not prevent ID reuse");
 }
 
+#[rstest::rstest]
+#[case::hard(SessionAffinityMode::Hard)]
+#[case::soft(SessionAffinityMode::Soft)]
 #[tokio::test]
-async fn hard_mode_rejects_dispatch_away_from_a_live_binding() {
-    let (core, first) = bound_session(SessionAffinityMode::Hard).await;
+async fn session_affinity_respects_mode_outside_allowlist(#[case] mode: SessionAffinityMode) {
+    let (core, first) = bound_session(mode).await;
     let other = if first.worker_id == 1 { 2 } else { 1 };
-
-    // Steering cannot reach the bound worker, so selection lands elsewhere.
     let mut request = session_reservation("r2", "s");
     request.allowed_worker_ids = Some(HashSet::from([other]));
-    let err = core
-        .select_and_reserve(request)
-        .await
-        .expect_err("hard affinity rejects a dispatch away from the binding");
-    assert!(matches!(err, SelectionError::BadRequest(_)), "{err:?}");
-    let entry = core.entry(&default_key()).expect("entry");
+    let result = core.select_and_reserve(request).await;
+    if mode == SessionAffinityMode::Hard {
+        assert!(matches!(result, Err(SelectionError::BadRequest(_))));
+        let entry = core.entry(&default_key()).unwrap();
+        wait_until("rejected booking release", || {
+            !entry.scheduler.has_request("r2")
+        })
+        .await;
+        assert!(core.reservation_index.read().is_empty());
+        assert_eq!(bound_worker(&core, "s"), None);
+        return;
+    }
+    let second = result.expect("soft rebind");
+    assert_eq!(second.worker_id, other);
+    assert_eq!(bound_worker(&core, "s"), Some(other));
+    assert_eq!(lease_count(&core, "s"), Some(1));
+}
+
+#[rstest::rstest]
+#[case::hard(SessionAffinityMode::Hard)]
+#[case::soft(SessionAffinityMode::Soft)]
+#[tokio::test]
+async fn affinity_policy_mismatch(#[case] mode: SessionAffinityMode) {
+    // Bind to an eligible worker different from the custom policy's choice.
+    let (policy, _) = capturing_policy_factory();
+    let (replication, updates) = HostReplication::channel(11);
+    let core = core_with(
+        test_config(false),
+        SelectionHost {
+            replication,
+            ..SelectionHost::default()
+        },
+        Some(policy),
+        WorkerType::Aggregated,
+        Some(SessionAffinityConfig::new(Duration::from_secs(10)).with_mode(mode)),
+    );
+    for id in [1, 2] {
+        core.upsert_worker(worker(id)).await.unwrap();
+    }
+    let preferred = core.select(select_request()).await.unwrap().worker_id;
+    let bound = if preferred == 1 { 2 } else { 1 };
+    core.dispatch_affinity_event(AffinityBindingEvent {
+        partition: default_key(),
+        session_id: "s".to_string(),
+        worker_id: bound,
+        dp_rank: Some(0),
+        sequence: 1,
+        writer_id: 99,
+    });
+    assert_eq!(bound_worker(&core, "s"), Some(bound));
+    // Hard affinity rejects the dispatch and releases its booking and binding.
+    let result = core
+        .select_and_reserve(session_reservation("next-turn", "s"))
+        .await;
+    if mode == SessionAffinityMode::Soft {
+        assert_eq!(result.unwrap().worker_id, preferred);
+        assert_eq!(bound_worker(&core, "s"), Some(preferred));
+        return;
+    }
+    assert!(matches!(result, Err(SelectionError::BadRequest(_))));
+    let entry = core.entry(&default_key()).unwrap();
     wait_until("rejected booking release", || {
-        !entry.scheduler.has_request("r2")
+        !entry.scheduler.has_request("next-turn")
     })
     .await;
     assert!(core.reservation_index.read().is_empty());
-    assert_eq!(bound_worker(&core, "s"), None, "stale binding is dropped");
+    assert_eq!(bound_worker(&core, "s"), None);
 
-    // The session's next request re-initializes.
-    let mut request = session_reservation("r3", "s");
-    request.allowed_worker_ids = Some(HashSet::from([other]));
-    let third = core.select_and_reserve(request).await.expect("rebind");
-    assert_eq!(third.worker_id, other);
-    assert_eq!(bound_worker(&core, "s"), Some(other));
-}
+    assert!(
+        updates
+            .try_iter()
+            .all(|event| !matches!(event, ReplicaUpdate::Reservation(_))),
+        "a rejected booking must never be exported"
+    );
 
-#[tokio::test]
-async fn soft_mode_follows_the_dispatch() {
-    let (core, first) = bound_session(SessionAffinityMode::Soft).await;
-    let other = if first.worker_id == 1 { 2 } else { 1 };
-
-    let mut request = session_reservation("r2", "s");
-    request.allowed_worker_ids = Some(HashSet::from([other]));
-    let second = core.select_and_reserve(request).await.expect("soft rebind");
-    assert_eq!(second.worker_id, other);
-    assert_eq!(bound_worker(&core, "s"), Some(other));
+    // The next turn can initialize a fresh binding after the rejection.
+    let next = core
+        .select_and_reserve(session_reservation("retry", "s"))
+        .await
+        .expect("rebind after rejection");
+    assert_eq!(next.worker_id, preferred);
+    assert_eq!(bound_worker(&core, "s"), Some(preferred));
 }
 
 #[tokio::test]
@@ -3915,4 +4006,217 @@ async fn overflowing_worker_dp_range_patch_preserves_live_worker() {
     })
     .await
     .expect("invalid worker patch deadline");
+}
+
+fn core_with_binding_stream(writer_id: u64) -> (SelectionCore, flume::Receiver<ReplicaUpdate>) {
+    let (replication, rx) = HostReplication::channel(writer_id);
+    let core = core_with(
+        test_config(false),
+        SelectionHost {
+            replication,
+            ..SelectionHost::default()
+        },
+        None,
+        WorkerType::Aggregated,
+        Some(
+            SessionAffinityConfig::new(Duration::from_secs(10))
+                .with_mode(SessionAffinityMode::Soft),
+        ),
+    );
+    (core, rx)
+}
+
+fn next_binding(updates: &flume::Receiver<ReplicaUpdate>) -> AffinityBindingEvent {
+    loop {
+        if let ReplicaUpdate::Affinity(binding) = updates.try_recv().expect("binding update") {
+            return binding;
+        }
+    }
+}
+
+#[rstest::rstest]
+#[case::atomic(false)]
+#[case::split(true)]
+#[tokio::test(start_paused = true)]
+async fn host_binding_stream_publishes_commits_and_release_refreshes(#[case] split: bool) {
+    let (source, updates) = core_with_binding_stream(11);
+    let (peer, peer_updates) = core_with_binding_stream(22);
+    for core in [&source, &peer] {
+        core.upsert_worker(worker(1)).await.unwrap();
+    }
+    if split {
+        let mut request = select_request();
+        request.selection_id = Some("turn".to_string());
+        request.session_id = Some("s".to_string());
+        source.select(request).await.unwrap();
+        assert!(updates.try_recv().is_err(), "a preview must not bind");
+        source
+            .create_reservation(replay_reservation("turn"))
+            .await
+            .unwrap();
+    } else {
+        source
+            .select_and_reserve(session_reservation("turn", "s"))
+            .await
+            .unwrap();
+    }
+    let binding = next_binding(&updates);
+    let reservation = updates.try_recv().expect("finalized booking update");
+    assert!(matches!(&reservation, ReplicaUpdate::Reservation(_)));
+    assert_eq!(
+        peer.apply_replica_update(reservation.clone())
+            .await
+            .unwrap(),
+        ReplicaApplyOutcome::Applied
+    );
+    assert_eq!(
+        peer.apply_replica_update(reservation).await.unwrap(),
+        ReplicaApplyOutcome::IgnoredConflict
+    );
+    assert_eq!(binding.partition, default_key());
+    assert_eq!(binding.writer_id, 11);
+    assert_eq!(binding.worker_id, 1);
+    assert_eq!(
+        peer.dispatch_affinity_event(binding.clone()),
+        ReplicaApplyOutcome::Inserted
+    );
+    assert!(peer_updates.try_recv().is_err(), "imports must not echo");
+    assert_eq!(peer.reservation_index.read().len(), 1);
+    assert_eq!(lease_count(&peer, "s"), Some(0));
+
+    // Shared frontend semantics: only the origin has an active lease. Release
+    // restores a peer that expired during a request longer than the idle TTL.
+    tokio::time::advance(Duration::from_secs(11)).await;
+    assert_eq!(bound_worker(&source, "s"), Some(1));
+    assert_eq!(bound_worker(&peer, "s"), None);
+    source.free_reservation("turn").await.unwrap();
+    // Worker completion still reaches every replica through the host.
+    peer.free_reservation("turn").await.unwrap();
+    assert!(peer.reservation_index.read().is_empty());
+    let refresh = next_binding(&updates);
+    assert_eq!(refresh.version(), binding.version());
+    peer.dispatch_affinity_event(refresh);
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert_eq!(bound_worker(&source, "s"), Some(1));
+    assert_eq!(bound_worker(&peer, "s"), Some(1));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(bound_worker(&source, "s"), None);
+    assert_eq!(bound_worker(&peer, "s"), None);
+    assert!(peer_updates.try_recv().is_err());
+}
+
+#[rstest::rstest]
+#[case::different_worker(false)]
+#[case::same_worker(true)]
+#[tokio::test]
+async fn bindings_converge_without_redirecting_delayed_request_load(
+    #[case] return_to_original: bool,
+) {
+    let (source, source_updates) = core_with_binding_stream(11);
+    let (peer, peer_updates) = core_with_binding_stream(22);
+    for core in [&source, &peer] {
+        for id in [1, 2, 3] {
+            core.upsert_worker(worker(id)).await.unwrap();
+        }
+    }
+    for (core, id) in [(&source, 1), (&peer, 2)] {
+        let mut request = session_reservation("first", "s");
+        request.allowed_worker_ids = Some(HashSet::from([id]));
+        core.select_and_reserve(request).await.unwrap();
+    }
+    let mut first = next_binding(&source_updates);
+    let mut concurrent = next_binding(&peer_updates);
+    let sequence = first.sequence.max(concurrent.sequence);
+    first.sequence = sequence;
+    concurrent.sequence = sequence;
+    for (core, events) in [
+        (&source, [&first, &concurrent]),
+        (&peer, [&concurrent, &first]),
+    ] {
+        for event in events {
+            core.dispatch_affinity_event(event.clone());
+        }
+        assert_eq!(
+            bound_worker(core, "s"),
+            Some(2),
+            "host writer id breaks sequence ties"
+        );
+    }
+    let replacement = if return_to_original { 1 } else { 3 };
+    let mut request = session_reservation("rebind", "s");
+    request.allowed_worker_ids = Some(HashSet::from([replacement]));
+    source.select_and_reserve(request).await.unwrap();
+    let newer = next_binding(&source_updates);
+    assert!(newer.version() > concurrent.version());
+    peer.dispatch_affinity_event(newer.clone());
+    peer.free_reservation("first").await.unwrap();
+    assert_eq!(
+        peer.dispatch_affinity_event(first.clone()),
+        ReplicaApplyOutcome::IgnoredConflict
+    );
+    peer.create_reservation(ReservationRequest {
+        worker_id: Some(first.worker_id),
+        dp_rank: first.dp_rank,
+        prompt: prompt(),
+        ..replay_reservation("delayed")
+    })
+    .await
+    .unwrap();
+    assert_eq!(bound_worker(&peer, "s"), Some(replacement));
+    // The delayed request still belongs to worker 1; it cannot lease the new binding.
+    assert_eq!(lease_count(&peer, "s"), Some(0));
+    assert_eq!(
+        peer.indexed_booking("delayed").unwrap().1.worker.worker_id,
+        1
+    );
+    peer.free_reservation("delayed").await.unwrap();
+    assert_eq!(bound_worker(&peer, "s"), Some(replacement));
+}
+
+#[tokio::test]
+async fn binding_apply_reports_missing_membership_and_invalid_input() {
+    let (core, _) = core_with_binding_stream(11);
+    let mut binding = AffinityBindingEvent {
+        partition: default_key(),
+        session_id: "s".to_string(),
+        worker_id: 1,
+        dp_rank: Some(0),
+        sequence: 1,
+        writer_id: 22,
+    };
+    assert_eq!(
+        core.dispatch_affinity_event(binding.clone()),
+        ReplicaApplyOutcome::UnknownPartition
+    );
+    core.upsert_worker(worker(2)).await.unwrap();
+    assert_eq!(
+        core.dispatch_affinity_event(binding.clone()),
+        ReplicaApplyOutcome::UnknownWorker
+    );
+    core.upsert_worker(worker(1)).await.unwrap();
+    assert_eq!(
+        core.dispatch_affinity_event(binding.clone()),
+        ReplicaApplyOutcome::Inserted
+    );
+    binding.session_id = "s".repeat(257);
+    assert_eq!(
+        core.dispatch_affinity_event(binding.clone()),
+        ReplicaApplyOutcome::RejectedSessionId
+    );
+    binding.session_id = "s".to_string();
+    binding.partition = RoutingPartitionId::new("other", "default");
+    let mut other = worker(3);
+    other.model_name = "other".to_string();
+    core.upsert_worker(other).await.unwrap();
+    assert_eq!(
+        core.dispatch_affinity_event(binding.clone()),
+        ReplicaApplyOutcome::UnknownWorker
+    );
+    let disabled = core_with_host(SelectionHost::default());
+    disabled.upsert_worker(worker(1)).await.unwrap();
+    binding.partition = default_key();
+    assert_eq!(
+        disabled.dispatch_affinity_event(binding),
+        ReplicaApplyOutcome::AffinityDisabled
+    );
 }

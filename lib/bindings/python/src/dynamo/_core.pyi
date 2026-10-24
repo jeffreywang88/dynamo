@@ -783,11 +783,17 @@ class SelectionService:
         replica_sync_peers: Optional[list[str]] = None,
         selection_cache: Optional[SelectionCacheConfig] = None,
         session_affinity_ttl_secs: Optional[float] = None,
+        session_affinity_mode: Literal["hard", "soft"] = "hard",
+        replication_writer_id: Optional[int] = None,
     ) -> None:
         """Create a selection service. `indexer_threads` sizes the KV indexer pool.
 
         `session_affinity_ttl_secs` enables session affinity with an idle TTL
         between 1 and 31536000 seconds.
+        `session_affinity_mode`: hard rejects dispatch away from a live binding;
+        soft rebinds when the bound worker is excluded from the request's candidates.
+        `replication_writer_id` exports bookings and affinity updates for a host transport;
+        use an id unique to this replica incarnation.
         """
         ...
 
@@ -799,6 +805,21 @@ class SelectionService:
         The KV indexer thread pool is released when the handle is dropped.
         Idempotent, and also runs automatically on drop.
         """
+        ...
+
+    async def shutdown_async(self) -> None:
+        """Await service shutdown without blocking the Python event loop."""
+        ...
+
+    def replica_updates(self) -> AsyncIterator[JsonLike]:
+        """Take the best-effort booking and affinity stream once; the host broadcasts it.
+
+        Requires replication_writer_id. Ends on shutdown; imports do not echo.
+        """
+        ...
+
+    async def apply_replica_update(self, update: JsonLike) -> str:
+        """Apply a peer booking or affinity update without echoing it; return its outcome."""
         ...
 
     async def upsert_worker(self, worker: JsonLike) -> JsonLike:

@@ -16,8 +16,11 @@ use crate::services::common::replica_sync::{
 use crate::services::indexer::backend::IndexerPolicy;
 use crate::tracking_hash::TrackingHashContext;
 
-use super::affinity::SessionAffinityConfig;
-use super::core::{KvIndexSource, SelectionCore, SelectionHost, SelectionServiceConfig};
+use super::affinity::{ReplicaApplyOutcome, SessionAffinityConfig, SessionAffinityMode};
+use super::core::{
+    HostReplication, KvIndexSource, ReplicaUpdate, SelectionCore, SelectionHost,
+    SelectionServiceConfig,
+};
 use super::error::SelectionError;
 use super::pending::SelectionCacheConfig;
 use super::types::{
@@ -40,6 +43,8 @@ pub struct SelectionServiceBuilder {
     host: SelectionHost,
     worker_selection_policy_factory: Option<WorkerSelectionPolicyFactory>,
     session_affinity_ttl: Option<Duration>,
+    session_affinity_mode: SessionAffinityMode,
+    replication_writer_id: Option<u64>,
     host_manages_request_lifecycle: bool,
 }
 
@@ -81,6 +86,8 @@ impl SelectionServiceBuilder {
             host: SelectionHost::default(),
             worker_selection_policy_factory: None,
             session_affinity_ttl: None,
+            session_affinity_mode: SessionAffinityMode::default(),
+            replication_writer_id: None,
             host_manages_request_lifecycle: false,
         }
     }
@@ -125,6 +132,19 @@ impl SelectionServiceBuilder {
         self
     }
 
+    /// Choose whether a live binding must be honored or may follow a new dispatch.
+    pub fn session_affinity_mode(mut self, mode: SessionAffinityMode) -> Self {
+        self.session_affinity_mode = mode;
+        self
+    }
+
+    /// Export finalized bookings and affinity updates for a host-owned transport.
+    /// Use an id unique to this replica incarnation.
+    pub fn replication(mut self, writer_id: u64) -> Self {
+        self.replication_writer_id = Some(writer_id);
+        self
+    }
+
     pub fn replica_sync(mut self, port: u16, peers: Vec<String>) -> Self {
         self.replica_sync_port = Some(port);
         self.replica_sync_peers = peers;
@@ -146,6 +166,23 @@ impl SelectionServiceBuilder {
     }
 
     pub async fn build(mut self) -> anyhow::Result<SelectionService> {
+        let replica_rx = if let Some(writer_id) = self.replication_writer_id {
+            anyhow::ensure!(
+                self.host.replication.outbound.is_none(),
+                "replica publisher already configured"
+            );
+            let (replication, rx) = HostReplication::channel(writer_id);
+            self.host.replication.writer_id = replication.writer_id;
+            self.host.replication.outbound = replication.outbound;
+            Some(rx)
+        } else {
+            None
+        };
+        anyhow::ensure!(
+            self.host.replication.outbound.is_none()
+                || (self.replica_sync_port.is_none() && self.host.replication.channels.is_none()),
+            "host replica stream cannot be combined with another replica transport"
+        );
         self.kv_router_config
             .apply_policy_config()
             .map_err(anyhow::Error::msg)?;
@@ -197,7 +234,8 @@ impl SelectionServiceBuilder {
             self.selection_cache,
             tracking_hash,
             indexer_policy,
-            self.session_affinity_ttl.map(SessionAffinityConfig::new),
+            self.session_affinity_ttl
+                .map(|ttl| SessionAffinityConfig::new(ttl).with_mode(self.session_affinity_mode)),
         ));
 
         if recover_from_peers {
@@ -241,6 +279,7 @@ impl SelectionServiceBuilder {
         startup_guard.disarm();
         Ok(SelectionService {
             core,
+            replica_rx: parking_lot::Mutex::new(replica_rx),
             peer_manager,
             replica_runtime,
             replica_sync_port: self.replica_sync_port,
@@ -301,13 +340,50 @@ impl Drop for StartupGuard {
 
 pub struct SelectionService {
     core: Arc<SelectionCore>,
+    replica_rx: parking_lot::Mutex<Option<flume::Receiver<ReplicaUpdate>>>,
     peer_manager: Option<Arc<PeerManager>>,
     replica_runtime: Option<ReplicaSyncRuntime>,
     replica_sync_port: Option<u16>,
     cancel_token: CancellationToken,
 }
 
+/// Single-consumer stream that terminates when the service shuts down.
+pub struct ReplicaUpdates {
+    rx: flume::Receiver<ReplicaUpdate>,
+    cancel_token: CancellationToken,
+}
+
+impl ReplicaUpdates {
+    pub async fn recv(&self) -> Option<ReplicaUpdate> {
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => None,
+            event = self.rx.recv_async() => event.ok(),
+        }
+    }
+}
+
 impl SelectionService {
+    /// Take the single-consumer replica stream configured by the host.
+    pub fn take_replica_updates(&self) -> Result<ReplicaUpdates, SelectionError> {
+        let rx = self.replica_rx.lock().take().ok_or_else(|| {
+            SelectionError::Conflict("replica stream is disabled or already taken".to_string())
+        })?;
+        Ok(ReplicaUpdates {
+            rx,
+            cancel_token: self.cancel_token.clone(),
+        })
+    }
+
+    /// Apply a peer update without publishing an echo.
+    pub async fn apply_replica_update(
+        &self,
+        update: ReplicaUpdate,
+    ) -> Result<ReplicaApplyOutcome, SelectionError> {
+        self.core.ensure_running()?;
+        self.core.apply_replica_update(update).await
+    }
+
     #[cfg(test)]
     pub(super) fn new_local_for_test(
         kv_router_config: KvRouterConfig,
@@ -315,6 +391,7 @@ impl SelectionService {
     ) -> Self {
         let cancel_token = CancellationToken::new();
         Self {
+            replica_rx: parking_lot::Mutex::new(None),
             core: Arc::new(
                 SelectionCore::try_new_local(
                     kv_router_config,
