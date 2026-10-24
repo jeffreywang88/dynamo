@@ -44,7 +44,7 @@ pub fn subagent_group_affinity_id(parent_session_id: &str) -> String {
 #[serde(rename_all = "lowercase")]
 pub enum SessionAffinityMode {
     /// The binding is exact: dispatching to another worker or rank is an error.
-    /// Hosts may invalidate an unavailable or excluded target before reselecting.
+    /// Hosts may invalidate an unavailable target before reselecting.
     #[default]
     Hard,
     /// The binding follows the dispatch: the session rebinds to where it ran.

@@ -4,7 +4,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::WorkerSelectionPolicyFactory;
@@ -18,7 +17,7 @@ use crate::services::common::replica_sync::{
 use crate::services::indexer::backend::IndexerPolicy;
 use crate::tracking_hash::TrackingHashContext;
 
-use super::affinity::{ReplicaApplyOutcome, SessionAffinityConfig};
+use super::affinity::{ReplicaApplyOutcome, SessionAffinityConfig, SessionAffinityMode};
 use super::core::{KvIndexSource, SelectionCore, SelectionHost, SelectionServiceConfig};
 use super::error::SelectionError;
 use super::pending::SelectionCacheConfig;
@@ -42,6 +41,7 @@ pub struct SelectionServiceBuilder {
     host: SelectionHost,
     worker_selection_policy_factory: Option<WorkerSelectionPolicyFactory>,
     session_affinity_ttl: Option<Duration>,
+    session_affinity_mode: SessionAffinityMode,
     session_replication_writer_id: Option<u64>,
     host_manages_request_lifecycle: bool,
 }
@@ -84,6 +84,7 @@ impl SelectionServiceBuilder {
             host: SelectionHost::default(),
             worker_selection_policy_factory: None,
             session_affinity_ttl: None,
+            session_affinity_mode: SessionAffinityMode::default(),
             session_replication_writer_id: None,
             host_manages_request_lifecycle: false,
         }
@@ -126,6 +127,12 @@ impl SelectionServiceBuilder {
     /// last request. Bindings replicate over the replica mesh when enabled.
     pub fn session_affinity(mut self, ttl: Duration) -> Self {
         self.session_affinity_ttl = Some(ttl);
+        self
+    }
+
+    /// Choose whether a live binding must be honored or may follow a new dispatch.
+    pub fn session_affinity_mode(mut self, mode: SessionAffinityMode) -> Self {
+        self.session_affinity_mode = mode;
         self
     }
 
@@ -228,7 +235,8 @@ impl SelectionServiceBuilder {
             self.selection_cache,
             tracking_hash,
             indexer_policy,
-            self.session_affinity_ttl.map(SessionAffinityConfig::new),
+            self.session_affinity_ttl
+                .map(|ttl| SessionAffinityConfig::new(ttl).with_mode(self.session_affinity_mode)),
         ));
 
         if recover_from_peers {
@@ -333,7 +341,7 @@ impl Drop for StartupGuard {
 
 pub struct SelectionService {
     core: Arc<SelectionCore>,
-    session_binding_rx: parking_lot::Mutex<Option<mpsc::Receiver<AffinityBindingEvent>>>,
+    session_binding_rx: parking_lot::Mutex<Option<flume::Receiver<AffinityBindingEvent>>>,
     peer_manager: Option<Arc<PeerManager>>,
     replica_runtime: Option<ReplicaSyncRuntime>,
     replica_sync_port: Option<u16>,
@@ -342,16 +350,16 @@ pub struct SelectionService {
 
 /// Single-consumer stream that terminates when the service shuts down.
 pub struct SessionBindingUpdates {
-    rx: mpsc::Receiver<AffinityBindingEvent>,
+    rx: flume::Receiver<AffinityBindingEvent>,
     cancel_token: CancellationToken,
 }
 
 impl SessionBindingUpdates {
-    pub async fn recv(&mut self) -> Option<AffinityBindingEvent> {
+    pub async fn recv(&self) -> Option<AffinityBindingEvent> {
         tokio::select! {
             biased;
             _ = self.cancel_token.cancelled() => None,
-            event = self.rx.recv() => event,
+            event = self.rx.recv_async() => event.ok(),
         }
     }
 }

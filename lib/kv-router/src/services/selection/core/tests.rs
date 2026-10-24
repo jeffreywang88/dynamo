@@ -3096,13 +3096,24 @@ async fn free_releases_reservation_and_affinity_without_actor_progress() {
 #[case::hard(SessionAffinityMode::Hard)]
 #[case::soft(SessionAffinityMode::Soft)]
 #[tokio::test]
-async fn session_rebinds_outside_allowlist(#[case] mode: SessionAffinityMode) {
+async fn session_affinity_respects_mode_outside_allowlist(#[case] mode: SessionAffinityMode) {
     let (core, first) = bound_session(mode).await;
     let other = if first.worker_id == 1 { 2 } else { 1 };
-    // Excluding the bound worker permits failover in either affinity mode.
     let mut request = session_reservation("r2", "s");
     request.allowed_worker_ids = Some(HashSet::from([other]));
-    let second = core.select_and_reserve(request).await.expect("rebind");
+    let result = core.select_and_reserve(request).await;
+    if mode == SessionAffinityMode::Hard {
+        assert!(matches!(result, Err(SelectionError::BadRequest(_))));
+        let entry = core.entry(&default_key()).unwrap();
+        wait_until("rejected booking release", || {
+            !entry.scheduler.has_request("r2")
+        })
+        .await;
+        assert!(core.reservation_index.read().is_empty());
+        assert_eq!(bound_worker(&core, "s"), None);
+        return;
+    }
+    let second = result.expect("soft rebind");
     assert_eq!(second.worker_id, other);
     assert_eq!(bound_worker(&core, "s"), Some(other));
     assert_eq!(lease_count(&core, "s"), Some(1));
@@ -3957,10 +3968,7 @@ async fn overflowing_worker_dp_range_patch_preserves_live_worker() {
 
 fn core_with_binding_stream(
     writer_id: u64,
-) -> (
-    SelectionCore,
-    tokio::sync::mpsc::Receiver<AffinityBindingEvent>,
-) {
+) -> (SelectionCore, flume::Receiver<AffinityBindingEvent>) {
     let (publisher, rx) = HostAffinityReplication::channel(writer_id);
     let core = core_with(
         test_config(false),
@@ -3973,7 +3981,10 @@ fn core_with_binding_stream(
         },
         None,
         WorkerType::Aggregated,
-        Some(SessionAffinityConfig::new(Duration::from_secs(10))),
+        Some(
+            SessionAffinityConfig::new(Duration::from_secs(10))
+                .with_mode(SessionAffinityMode::Soft),
+        ),
     );
     (core, rx)
 }
@@ -3983,8 +3994,8 @@ fn core_with_binding_stream(
 #[case::split(true)]
 #[tokio::test(start_paused = true)]
 async fn host_binding_stream_publishes_commits_and_release_refreshes(#[case] split: bool) {
-    let (source, mut updates) = core_with_binding_stream(11);
-    let (peer, mut peer_updates) = core_with_binding_stream(22);
+    let (source, updates) = core_with_binding_stream(11);
+    let (peer, peer_updates) = core_with_binding_stream(22);
     for core in [&source, &peer] {
         core.upsert_worker(worker(1)).await.unwrap();
     }
@@ -4041,8 +4052,8 @@ async fn host_binding_stream_publishes_commits_and_release_refreshes(#[case] spl
 async fn bindings_converge_without_redirecting_delayed_request_load(
     #[case] return_to_original: bool,
 ) {
-    let (source, mut source_updates) = core_with_binding_stream(11);
-    let (peer, mut peer_updates) = core_with_binding_stream(22);
+    let (source, source_updates) = core_with_binding_stream(11);
+    let (peer, peer_updates) = core_with_binding_stream(22);
     for core in [&source, &peer] {
         for id in [1, 2, 3] {
             core.upsert_worker(worker(id)).await.unwrap();
