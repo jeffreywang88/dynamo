@@ -1475,7 +1475,7 @@ async fn lease_admission_installs_no_index_row_and_records_nothing() {
 
 #[tokio::test]
 async fn dropped_selection_future_frees_its_booking() {
-    let core = local_core(test_config(false));
+    let (core, updates) = core_with_binding_stream(11);
     core.upsert_worker(worker(1)).await.expect("worker upsert");
     let key = default_key();
     let entry = core.entry(&key).expect("entry");
@@ -1509,6 +1509,10 @@ async fn dropped_selection_future_frees_its_booking() {
     })
     .await;
     assert!(core.reservation_index.read().get("dropped").is_none());
+    assert!(
+        updates.try_recv().is_err(),
+        "cancelled bookings must not be exported"
+    );
 }
 
 #[rstest::rstest]
@@ -1657,8 +1661,11 @@ async fn shutdown_interrupts_indexer_waits(
 /// session commit) and the index install; the armed lease, not lock
 /// discipline, covers it. Dropping the run there frees the booking and
 /// releases the id claim.
+#[rstest::rstest]
+#[case::atomic(false)]
+#[case::split(true)]
 #[tokio::test]
-async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() {
+async fn dropped_book_selection_during_routing_record_frees_booking_and_claim(#[case] split: bool) {
     use crate::indexer::TieredMatchDetails;
     use crate::services::indexer::backend::RemotePrimary;
     struct PausedRecord {
@@ -1702,9 +1709,11 @@ async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() 
         entered: AtomicBool::new(false),
         release: tokio::sync::Notify::new(),
     });
+    let (replication, updates) = HostReplication::channel(11);
     let core = core_with(
         test_config(false),
         SelectionHost {
+            replication,
             cache: HostCache {
                 index: KvIndexSource::Owned(Arc::new(PausedRecordIngress(record.clone()))),
                 shared: None,
@@ -1723,7 +1732,23 @@ async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() 
     let entry = core.entry(&key).expect("entry");
 
     // Poll by hand until the booking exists and the record is awaited.
-    let mut selection = Box::pin(core.select_and_reserve(session_reservation("recording", "s")));
+    if split {
+        let mut request = select_request();
+        request.selection_id = Some("recording".to_string());
+        request.session_id = Some("s".to_string());
+        core.select(request).await.unwrap();
+    }
+    let mut selection = Box::pin(async {
+        if split {
+            core.create_reservation(replay_reservation("recording"))
+                .await
+                .map(|_| ())
+        } else {
+            core.select_and_reserve(session_reservation("recording", "s"))
+                .await
+                .map(|_| ())
+        }
+    });
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     wait_until("routing record entered", || {
         if record.entered.load(Ordering::Acquire) {
@@ -1758,6 +1783,12 @@ async fn dropped_book_selection_during_routing_record_frees_booking_and_claim() 
     assert!(
         core.reservation_index.read().get("recording").is_none(),
         "the claim is released with the booking"
+    );
+    assert!(
+        updates
+            .try_iter()
+            .all(|event| !matches!(event, ReplicaUpdate::Reservation(_))),
+        "a booking cancelled during recording must not be exported"
     );
 }
 
@@ -3126,9 +3157,13 @@ async fn session_affinity_respects_mode_outside_allowlist(#[case] mode: SessionA
 async fn affinity_policy_mismatch(#[case] mode: SessionAffinityMode) {
     // Bind to an eligible worker different from the custom policy's choice.
     let (policy, _) = capturing_policy_factory();
+    let (replication, updates) = HostReplication::channel(11);
     let core = core_with(
         test_config(false),
-        SelectionHost::default(),
+        SelectionHost {
+            replication,
+            ..SelectionHost::default()
+        },
         Some(policy),
         WorkerType::Aggregated,
         Some(SessionAffinityConfig::new(Duration::from_secs(10)).with_mode(mode)),
@@ -3164,6 +3199,13 @@ async fn affinity_policy_mismatch(#[case] mode: SessionAffinityMode) {
     .await;
     assert!(core.reservation_index.read().is_empty());
     assert_eq!(bound_worker(&core, "s"), None);
+
+    assert!(
+        updates
+            .try_iter()
+            .all(|event| !matches!(event, ReplicaUpdate::Reservation(_))),
+        "a rejected booking must never be exported"
+    );
 
     // The next turn can initialize a fresh binding after the rejection.
     let next = core
@@ -3966,17 +4008,12 @@ async fn overflowing_worker_dp_range_patch_preserves_live_worker() {
     .expect("invalid worker patch deadline");
 }
 
-fn core_with_binding_stream(
-    writer_id: u64,
-) -> (SelectionCore, flume::Receiver<AffinityBindingEvent>) {
-    let (publisher, rx) = HostAffinityReplication::channel(writer_id);
+fn core_with_binding_stream(writer_id: u64) -> (SelectionCore, flume::Receiver<ReplicaUpdate>) {
+    let (replication, rx) = HostReplication::channel(writer_id);
     let core = core_with(
         test_config(false),
         SelectionHost {
-            replication: HostReplication {
-                affinity: Some(publisher),
-                ..HostReplication::default()
-            },
+            replication,
             ..SelectionHost::default()
         },
         None,
@@ -3987,6 +4024,14 @@ fn core_with_binding_stream(
         ),
     );
     (core, rx)
+}
+
+fn next_binding(updates: &flume::Receiver<ReplicaUpdate>) -> AffinityBindingEvent {
+    loop {
+        if let ReplicaUpdate::Affinity(binding) = updates.try_recv().expect("binding update") {
+            return binding;
+        }
+    }
 }
 
 #[rstest::rstest]
@@ -4015,7 +4060,19 @@ async fn host_binding_stream_publishes_commits_and_release_refreshes(#[case] spl
             .await
             .unwrap();
     }
-    let binding = updates.try_recv().expect("commit publishes synchronously");
+    let binding = next_binding(&updates);
+    let reservation = updates.try_recv().expect("finalized booking update");
+    assert!(matches!(&reservation, ReplicaUpdate::Reservation(_)));
+    assert_eq!(
+        peer.apply_replica_update(reservation.clone())
+            .await
+            .unwrap(),
+        ReplicaApplyOutcome::Applied
+    );
+    assert_eq!(
+        peer.apply_replica_update(reservation).await.unwrap(),
+        ReplicaApplyOutcome::IgnoredConflict
+    );
     assert_eq!(binding.partition, default_key());
     assert_eq!(binding.writer_id, 11);
     assert_eq!(binding.worker_id, 1);
@@ -4024,7 +4081,7 @@ async fn host_binding_stream_publishes_commits_and_release_refreshes(#[case] spl
         ReplicaApplyOutcome::Inserted
     );
     assert!(peer_updates.try_recv().is_err(), "imports must not echo");
-    assert!(peer.reservation_index.read().is_empty());
+    assert_eq!(peer.reservation_index.read().len(), 1);
     assert_eq!(lease_count(&peer, "s"), Some(0));
 
     // Shared frontend semantics: only the origin has an active lease. Release
@@ -4033,7 +4090,10 @@ async fn host_binding_stream_publishes_commits_and_release_refreshes(#[case] spl
     assert_eq!(bound_worker(&source, "s"), Some(1));
     assert_eq!(bound_worker(&peer, "s"), None);
     source.free_reservation("turn").await.unwrap();
-    let refresh = updates.try_recv().unwrap();
+    // Worker completion still reaches every replica through the host.
+    peer.free_reservation("turn").await.unwrap();
+    assert!(peer.reservation_index.read().is_empty());
+    let refresh = next_binding(&updates);
     assert_eq!(refresh.version(), binding.version());
     peer.dispatch_affinity_event(refresh);
     tokio::time::advance(Duration::from_secs(9)).await;
@@ -4064,8 +4124,8 @@ async fn bindings_converge_without_redirecting_delayed_request_load(
         request.allowed_worker_ids = Some(HashSet::from([id]));
         core.select_and_reserve(request).await.unwrap();
     }
-    let mut first = source_updates.try_recv().unwrap();
-    let mut concurrent = peer_updates.try_recv().unwrap();
+    let mut first = next_binding(&source_updates);
+    let mut concurrent = next_binding(&peer_updates);
     let sequence = first.sequence.max(concurrent.sequence);
     first.sequence = sequence;
     concurrent.sequence = sequence;
@@ -4086,7 +4146,7 @@ async fn bindings_converge_without_redirecting_delayed_request_load(
     let mut request = session_reservation("rebind", "s");
     request.allowed_worker_ids = Some(HashSet::from([replacement]));
     source.select_and_reserve(request).await.unwrap();
-    let newer = source_updates.try_recv().unwrap();
+    let newer = next_binding(&source_updates);
     assert!(newer.version() > concurrent.version());
     peer.dispatch_affinity_event(newer.clone());
     peer.free_reservation("first").await.unwrap();

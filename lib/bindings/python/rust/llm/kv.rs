@@ -659,13 +659,13 @@ pub(crate) struct SelectionService {
 
 #[cfg(feature = "select-service")]
 #[pyclass]
-pub(crate) struct SessionBindingStream {
-    updates: Arc<selection::SessionBindingUpdates>,
+pub(crate) struct ReplicaUpdateStream {
+    updates: Arc<selection::ReplicaUpdates>,
 }
 
 #[cfg(feature = "select-service")]
 #[pymethods]
-impl SessionBindingStream {
+impl ReplicaUpdateStream {
     fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
@@ -686,7 +686,7 @@ impl SessionBindingStream {
 impl SelectionService {
     /// Create a selection service. `indexer_threads` sizes the KV indexer pool.
     #[new]
-    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None, session_affinity_ttl_secs = None, session_affinity_mode = "hard", session_replication_writer_id = None))]
+    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None, session_affinity_ttl_secs = None, session_affinity_mode = "hard", replication_writer_id = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -697,7 +697,7 @@ impl SelectionService {
         selection_cache: Option<SelectionCacheConfig>,
         session_affinity_ttl_secs: Option<f64>,
         session_affinity_mode: &str,
-        session_replication_writer_id: Option<u64>,
+        replication_writer_id: Option<u64>,
     ) -> PyResult<Self> {
         let session_affinity_mode = session_affinity_mode
             .parse::<RsSessionAffinityMode>()
@@ -729,8 +729,8 @@ impl SelectionService {
                 session_affinity_ttl_from_secs(ttl).map_err(PyValueError::new_err)?,
             );
         }
-        if let Some(writer_id) = session_replication_writer_id {
-            builder = builder.session_binding_replication(writer_id);
+        if let Some(writer_id) = replication_writer_id {
+            builder = builder.replication(writer_id);
         }
         let inner = py
             .allow_threads(|| crate::bridge_runtime().block_on(builder.build()))
@@ -750,28 +750,29 @@ impl SelectionService {
         py.allow_threads(|| crate::bridge_runtime().block_on(service.shutdown()));
     }
 
-    /// Take the bounded, best-effort binding stream. May only be taken once.
-    fn session_binding_updates(&self) -> PyResult<SessionBindingStream> {
-        Ok(SessionBindingStream {
+    /// Take the bounded, best-effort replica stream. May only be taken once.
+    fn replica_updates(&self) -> PyResult<ReplicaUpdateStream> {
+        Ok(ReplicaUpdateStream {
             updates: Arc::new(
                 self.inner
-                    .take_session_binding_updates()
+                    .take_replica_updates()
                     .map_err(selection_to_pyerr)?,
             ),
         })
     }
 
-    fn apply_session_binding<'p>(
+    fn apply_replica_update<'p>(
         &self,
         py: Python<'p>,
-        binding: PyObject,
+        update: PyObject,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let event: selection::AffinityBindingEvent =
-            depythonize(binding.bind(py)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let event: selection::ReplicaUpdate =
+            depythonize(update.bind(py)).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let service = self.inner.clone();
         crate::future_into_py(py, async move {
             let outcome = service
-                .apply_session_binding(event)
+                .apply_replica_update(event)
+                .await
                 .map_err(selection_to_pyerr)?;
             Python::with_gil(|py| {
                 pythonize(py, &outcome)

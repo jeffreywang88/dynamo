@@ -766,7 +766,7 @@ class SelectionService:
         selection_cache: Optional[SelectionCacheConfig] = None,
         session_affinity_ttl_secs: Optional[float] = None,
         session_affinity_mode: Literal["hard", "soft"] = "hard",
-        session_replication_writer_id: Optional[int] = None,
+        replication_writer_id: Optional[int] = None,
     ) -> None:
         """Create a selection service. `indexer_threads` sizes the KV indexer pool.
 
@@ -774,8 +774,8 @@ class SelectionService:
         between 1 and 31536000 seconds.
         `session_affinity_mode`: hard rejects dispatch away from a live binding;
         soft rebinds when the bound worker is excluded from the request's candidates.
-        `session_replication_writer_id` exports bindings for a host-owned transport
-        instead of the built-in mesh; use an id unique to this replica incarnation.
+        `replication_writer_id` exports bookings and affinity updates for a host transport;
+        use an id unique to this replica incarnation.
         """
         ...
 
@@ -793,16 +793,15 @@ class SelectionService:
         """Await service shutdown without blocking the Python event loop."""
         ...
 
-    def session_binding_updates(self) -> AsyncIterator[JsonLike]:
-        """Take the best-effort binding stream once; the host controls broadcasting.
+    def replica_updates(self) -> AsyncIterator[JsonLike]:
+        """Take the best-effort booking and affinity stream once; the host broadcasts it.
 
-        Requires session_replication_writer_id. Yields commits and TTL refreshes,
-        ends on shutdown, and does not echo imported bindings.
+        Requires replication_writer_id. Ends on shutdown; imports do not echo.
         """
         ...
 
-    async def apply_session_binding(self, binding: JsonLike) -> str:
-        """Apply a peer binding without booking load; return its outcome string."""
+    async def apply_replica_update(self, update: JsonLike) -> str:
+        """Apply a peer booking or affinity update without echoing it; return its outcome."""
         ...
 
     async def upsert_worker(self, worker: JsonLike) -> JsonLike:

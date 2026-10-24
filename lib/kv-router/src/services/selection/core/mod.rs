@@ -42,8 +42,8 @@ use crate::sequences::{
     ReplicaWorkerPolicy, SequenceRequest, SequenceTrackerOptions, active_request_expiry_duration,
 };
 use crate::services::common::replica_sync::{
-    HostAffinityReplication, HostReplicaSyncFactory, ReplicaInbox, ReplicaSyncConfig,
-    SchedulerLoadSink, ScopedReplicaEvent, ScopedSequencePublisher, setup_scoped_replica_sync,
+    AffinityMeshSink, HostReplicaSyncFactory, ReplicaInbox, ReplicaSyncConfig, SchedulerLoadSink,
+    ScopedReplicaEvent, ScopedSequencePublisher, setup_scoped_replica_sync,
 };
 use crate::services::indexer::backend::{Indexer, IndexerPolicy};
 use crate::services::indexer::recovery;
@@ -54,12 +54,14 @@ use crate::tracking_hash::{TrackingHashContext, TrackingHashScope};
 mod hint;
 mod operation;
 mod queries;
+mod replication;
 mod reservations;
 mod run;
 #[cfg(test)]
 mod tests;
 mod workers;
 
+pub use replication::{ReplicaUpdate, ReservationReplicaEvent};
 use reservations::ReservationIndex;
 
 pub use operation::{
@@ -130,7 +132,7 @@ struct SelectionEntry {
     replica_inbox: Option<ReplicaInbox>,
     affinity: OnceCell<SessionAffinity>,
     replica_config: Option<ReplicaSyncConfig>,
-    affinity_replication: Option<HostAffinityReplication>,
+    affinity_replication: Option<(u64, Arc<dyn super::affinity::AffinityReplicaSink>)>,
 }
 
 impl SelectionEntry {
@@ -146,8 +148,8 @@ impl SelectionEntry {
                     && let Some(sink) = config.affinity_sink(&self.key)
                 {
                     table.enable_replication(config.process_id(), sink);
-                } else if let Some(replication) = &self.affinity_replication {
-                    table.enable_replication(replication.writer_id, replication.sink(&self.key));
+                } else if let Some((writer_id, sink)) = &self.affinity_replication {
+                    table.enable_replication(*writer_id, sink.clone());
                 }
                 Ok(table)
             })?;
@@ -231,8 +233,9 @@ pub struct HostTelemetry {
 /// ignored when the service runs its own mesh; affinity requires one transport.
 #[derive(Clone)]
 pub struct HostReplication {
-    /// Session bindings exported independently of request-load replication.
-    pub affinity: Option<HostAffinityReplication>,
+    /// Identity and outbound updates for host-carried bookings and affinity.
+    pub writer_id: u64,
+    pub outbound: Option<flume::Sender<ReplicaUpdate>>,
     pub channels: Option<HostReplicaSyncFactory>,
     /// Owns request expiry when supplied; the partition then expires only through lifecycle events.
     pub request_leases: Option<Arc<dyn ReplicaRequestLeaseObserver>>,
@@ -244,11 +247,42 @@ pub struct HostReplication {
 impl Default for HostReplication {
     fn default() -> Self {
         Self {
-            affinity: None,
+            writer_id: 0,
+            outbound: None,
             channels: None,
             request_leases: None,
             replica_worker_policy: ReplicaWorkerPolicy::RequireRegistered,
         }
+    }
+}
+
+impl HostReplication {
+    pub fn channel(writer_id: u64) -> (Self, flume::Receiver<ReplicaUpdate>) {
+        let (tx, rx) =
+            flume::bounded(super::super::common::replica_sync::REPLICA_EVENT_CHANNEL_CAPACITY);
+        (
+            Self {
+                writer_id,
+                outbound: Some(tx),
+                ..Self::default()
+            },
+            rx,
+        )
+    }
+
+    fn affinity_sink(
+        &self,
+        partition: &RoutingPartitionId,
+    ) -> Option<(u64, Arc<dyn super::affinity::AffinityReplicaSink>)> {
+        self.outbound.as_ref().map(|tx| {
+            (
+                self.writer_id,
+                Arc::new(AffinityMeshSink {
+                    partition: partition.clone(),
+                    tx: tx.clone(),
+                }) as Arc<dyn super::affinity::AffinityReplicaSink>,
+            )
+        })
     }
 }
 

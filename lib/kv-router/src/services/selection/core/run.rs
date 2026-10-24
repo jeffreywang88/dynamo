@@ -526,6 +526,30 @@ impl SelectionCore {
                     .await;
             }
             claim.install(booking, affinity_lease)?;
+            if self.host.replication.outbound.is_some() {
+                self.publish_reservation(ReservationReplicaEvent {
+                    partition: key.clone(),
+                    writer_id: self.host.replication.writer_id,
+                    block_size: entry.block_size,
+                    selection_id: admission
+                        .request_id()
+                        .expect("Book admission has an id")
+                        .to_string(),
+                    worker_id: response.best_worker.worker_id,
+                    dp_rank: response.best_worker.dp_rank,
+                    sequence_hashes: booked_sequence_hashes
+                        .as_ref()
+                        .expect("Book admission has hashes")
+                        .iter()
+                        .map(|&hash| hash as i64)
+                        .collect(),
+                    isl_tokens,
+                    expected_output_tokens,
+                    effective_prefill_tokens: track_prefill_tokens.then_some(effective_prefill),
+                    track_prefill_tokens,
+                    lora_name: prompt.lora_name.map(str::to_string),
+                });
+            }
             None
         } else {
             booking

@@ -90,6 +90,7 @@ pub trait AffinityReplicaSink: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicaApplyOutcome {
+    Applied,
     Inserted,
     Refreshed,
     ReplacedExpired,

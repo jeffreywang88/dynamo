@@ -64,13 +64,13 @@ impl AffinityBindingEvent {
 #[cfg(feature = "standalone-selection")]
 /// Publishes bindings from a [`super::super::selection::affinity::SessionAffinity`]
 /// into a transport channel. Best effort: a full channel drops the update.
-struct AffinityChannelSink {
-    partition: RoutingPartitionId,
-    tx: flume::Sender<AffinityBindingEvent>,
+pub(crate) struct AffinityMeshSink<T> {
+    pub(crate) partition: RoutingPartitionId,
+    pub(crate) tx: flume::Sender<T>,
 }
 
 #[cfg(feature = "standalone-selection")]
-impl AffinityReplicaSink for AffinityChannelSink {
+impl<T: From<AffinityBindingEvent> + Send + Sync> AffinityReplicaSink for AffinityMeshSink<T> {
     fn publish(&self, session_id: &str, target: AffinityTarget, version: AffinityVersion) {
         let update = AffinityBindingEvent {
             partition: self.partition.clone(),
@@ -80,33 +80,9 @@ impl AffinityReplicaSink for AffinityChannelSink {
             sequence: version.sequence,
             writer_id: version.writer_id,
         };
-        if let Err(error) = self.tx.try_send(update) {
+        if let Err(error) = self.tx.try_send(update.into()) {
             tracing::trace!(%error, "dropping best-effort session affinity replica update");
         }
-    }
-}
-
-/// A host-owned transport for session bindings. Each partition installs a sink
-/// into this bounded, best-effort channel; the host decides when to broadcast.
-#[cfg(feature = "standalone-selection")]
-#[derive(Clone)]
-pub struct HostAffinityReplication {
-    pub(crate) writer_id: u64,
-    tx: flume::Sender<AffinityBindingEvent>,
-}
-
-#[cfg(feature = "standalone-selection")]
-impl HostAffinityReplication {
-    pub fn channel(writer_id: u64) -> (Self, flume::Receiver<AffinityBindingEvent>) {
-        let (tx, rx) = flume::bounded(AFFINITY_EVENT_CHANNEL_CAPACITY);
-        (Self { writer_id, tx }, rx)
-    }
-
-    pub(crate) fn sink(&self, partition: &RoutingPartitionId) -> Arc<dyn AffinityReplicaSink> {
-        Arc::new(AffinityChannelSink {
-            partition: partition.clone(),
-            tx: self.tx.clone(),
-        })
     }
 }
 
@@ -207,7 +183,7 @@ impl ReplicaSyncConfig {
         partition: &RoutingPartitionId,
     ) -> Option<Arc<dyn AffinityReplicaSink>> {
         self.affinity_tx.clone().map(|tx| {
-            Arc::new(AffinityChannelSink {
+            Arc::new(AffinityMeshSink {
                 tx,
                 partition: partition.clone(),
             }) as Arc<dyn AffinityReplicaSink>

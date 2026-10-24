@@ -30,13 +30,14 @@ pub use crate::plugins::{
     WorkerSelectionPolicyRegistryError,
 };
 pub use crate::services::common::replica_sync::{
-    AffinityBindingEvent, HostAffinityReplication, HostReplicaChannels, HostReplicaSyncFactory,
-    ReplicaIngressObserver, ReplicaPeerError, SchedulerLoadSink,
+    AffinityBindingEvent, HostReplicaChannels, HostReplicaSyncFactory, ReplicaIngressObserver,
+    ReplicaPeerError, SchedulerLoadSink,
 };
 pub use core::{
-    HostCache, HostEligibility, HostLoad, HostReplication, HostTelemetry, KvIndexSource, Selected,
-    SelectionAdmission, SelectionCore, SelectionHost, SelectionOperation, SelectionOutcome,
-    SelectionPartition, SelectionRun, SelectionScheduler, SelectionServiceConfig, SessionBinding,
+    HostCache, HostEligibility, HostLoad, HostReplication, HostTelemetry, KvIndexSource,
+    ReplicaUpdate, ReservationReplicaEvent, Selected, SelectionAdmission, SelectionCore,
+    SelectionHost, SelectionOperation, SelectionOutcome, SelectionPartition, SelectionRun,
+    SelectionScheduler, SelectionServiceConfig, SessionBinding,
 };
 pub use error::SelectionError;
 pub use ingress::KvEventIngress;
@@ -45,7 +46,7 @@ pub use membership::{CatalogObserver, CatalogReconciler, WorkerCatalogSource};
 pub use pending::SelectionCacheConfig;
 pub use server::{AppState, run_server};
 pub use service::{
-    SelectionService, SelectionServiceBuilder, SessionBindingUpdates,
+    ReplicaUpdates, SelectionService, SelectionServiceBuilder,
     warn_for_unserved_worker_selection_policies,
 };
 pub use types::{

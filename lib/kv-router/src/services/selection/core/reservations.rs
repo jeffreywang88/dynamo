@@ -18,6 +18,7 @@ struct ReservationBooking {
     selection_id: String,
     worker: WorkerWithDpRank,
     sequence_hashes: Vec<SequenceHash>,
+    isl_tokens: usize,
     prefill_load_hint: Option<PrefillLoadHint>,
     expected_output_tokens: Option<u32>,
     track_prefill_tokens: bool,
@@ -193,7 +194,7 @@ impl SelectionCore {
         // any cached selection for the id so a later replay can't book stale state.
         if let Some(worker_id) = req.worker_id {
             self.selection_cache.discard(&key, &req.selection_id);
-            return self.reserve_explicit(key, worker_id, req).await;
+            return self.reserve_explicit(key, worker_id, req, true).await;
         }
 
         // Replay form: peek, book, and consume only once the booking lands. A
@@ -241,6 +242,7 @@ impl SelectionCore {
                 selection_id: req.selection_id.clone(),
                 worker: pending.worker,
                 sequence_hashes: pending.sequence_hashes.clone(),
+                isl_tokens: pending.isl_tokens,
                 prefill_load_hint: track_prefill_tokens.then_some(prefill_load_hint),
                 expected_output_tokens: pending.expected_output_tokens,
                 track_prefill_tokens,
@@ -248,6 +250,7 @@ impl SelectionCore {
                 routing_hashes: pending.routing_hashes.clone(),
                 session_id: pending.session_id.clone(),
             },
+            true,
         )
         .await
     }
@@ -294,11 +297,12 @@ impl SelectionCore {
     }
 
     /// Book a reservation from a self-contained request (explicit worker_id and prompt).
-    async fn reserve_explicit(
+    pub(super) async fn reserve_explicit(
         &self,
         key: RoutingPartitionId,
         worker_id: WorkerId,
         req: ReservationRequest,
+        publish: bool,
     ) -> Result<ReservationResponse, SelectionError> {
         let entry = self.ready_entry(&key)?;
         let normalized = req.prompt.view().normalize_for_reservation(
@@ -349,6 +353,7 @@ impl SelectionCore {
                 selection_id: req.selection_id,
                 worker,
                 sequence_hashes: normalized.sequence_hashes,
+                isl_tokens: normalized.isl_tokens,
                 prefill_load_hint,
                 expected_output_tokens: req.expected_output_tokens,
                 track_prefill_tokens,
@@ -356,6 +361,7 @@ impl SelectionCore {
                 routing_hashes,
                 session_id: None,
             },
+            publish,
         )
         .await
     }
@@ -368,12 +374,14 @@ impl SelectionCore {
         entry: Arc<SelectionEntry>,
         endpoint: String,
         booking: ReservationBooking,
+        publish: bool,
     ) -> Result<ReservationResponse, SelectionError> {
         let ReservationBooking {
             key,
             selection_id,
             worker,
             sequence_hashes,
+            isl_tokens,
             prefill_load_hint,
             expected_output_tokens,
             track_prefill_tokens,
@@ -383,6 +391,23 @@ impl SelectionCore {
         } = booking;
 
         let claim = self.claim_reservation(&selection_id, &key)?;
+        let replica = (publish && self.host.replication.outbound.is_some()).then(|| {
+            ReservationReplicaEvent {
+                partition: key.clone(),
+                writer_id: self.host.replication.writer_id,
+                block_size: entry.block_size,
+                selection_id: selection_id.clone(),
+                worker_id: worker.worker_id,
+                dp_rank: worker.dp_rank,
+                sequence_hashes: sequence_hashes.iter().map(|&hash| hash as i64).collect(),
+                isl_tokens,
+                expected_output_tokens,
+                effective_prefill_tokens: prefill_load_hint
+                    .map(|hint| hint.initial_effective_prefill_tokens),
+                track_prefill_tokens,
+                lora_name: lora_name.clone(),
+            }
+        });
         // Hold the session before booking: holding after would wait on an
         // initializer that may itself be waiting for this worker's capacity.
         let session = match (session_id.as_deref(), entry.affinity.get()) {
@@ -416,6 +441,9 @@ impl SelectionCore {
             self.record_routing_decision(&entry, worker, hashes).await;
         }
         claim.install(booking, affinity_lease)?;
+        if let Some(replica) = replica {
+            self.publish_reservation(replica);
+        }
 
         Ok(ReservationResponse {
             selection_id,
