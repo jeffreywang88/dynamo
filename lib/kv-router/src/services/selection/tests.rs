@@ -44,28 +44,26 @@ fn app() -> Router {
     create_router(Arc::new(AppState { service }))
 }
 
-#[rstest::rstest]
-#[case::no_affinity(false)]
-#[case::mesh_enabled(true)]
 #[tokio::test]
-async fn host_binding_stream_requires_exclusive_affinity_transport(#[case] mesh: bool) {
-    let mut builder = SelectionServiceBuilder::new(
-        test_config(),
-        crate::WorkerType::Aggregated,
-        RouterPluginRegistry::default(),
-    )
-    .session_binding_replication(11);
-    if mesh {
-        builder = builder
-            .session_affinity(Duration::from_secs(10))
-            .replica_sync(0, Vec::new());
-    }
-    let error = builder.build().await.err().expect("invalid configuration");
-    assert!(error.to_string().contains(if mesh {
-        "cannot be combined"
-    } else {
-        "requires session affinity"
-    }));
+async fn binding_stream_rejects_invalid_config() {
+    let builder = || {
+        SelectionServiceBuilder::new(
+            test_config(),
+            crate::WorkerType::Aggregated,
+            RouterPluginRegistry::default(),
+        )
+        .session_binding_replication(11)
+    };
+    let error = builder().build().await.err().expect("affinity disabled");
+    assert!(error.to_string().contains("requires session affinity"));
+    let error = builder()
+        .session_affinity(Duration::from_secs(10))
+        .replica_sync(0, Vec::new())
+        .build()
+        .await
+        .err()
+        .expect("mesh enabled");
+    assert!(error.to_string().contains("cannot be combined"));
 }
 
 struct WorkerIdScorer;

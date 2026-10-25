@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use dynamo_tokens::SequenceHash;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -42,8 +42,9 @@ use crate::sequences::{
     ReplicaWorkerPolicy, SequenceRequest, SequenceTrackerOptions, active_request_expiry_duration,
 };
 use crate::services::common::replica_sync::{
-    HostAffinityReplication, HostReplicaSyncFactory, ReplicaInbox, ReplicaSyncConfig,
-    SchedulerLoadSink, ScopedReplicaEvent, ScopedSequencePublisher, setup_scoped_replica_sync,
+    AFFINITY_EVENT_CHANNEL_CAPACITY, AffinityMeshSink, HostReplicaSyncFactory, ReplicaInbox,
+    ReplicaSyncConfig, SchedulerLoadSink, ScopedReplicaEvent, ScopedSequencePublisher,
+    setup_scoped_replica_sync,
 };
 use crate::services::indexer::backend::{Indexer, IndexerPolicy};
 use crate::services::indexer::recovery;
@@ -68,8 +69,7 @@ pub use operation::{
 };
 
 use super::affinity::{
-    AcquireStep, AffinityError, AffinityLease, Hold, ReplicaApplyOutcome, SessionAffinity,
-    SessionAffinityConfig,
+    AcquireStep, AffinityError, AffinityLease, Hold, SessionAffinity, SessionAffinityConfig,
 };
 use super::catalog::WorkerCatalog;
 use super::error::SelectionError;
@@ -130,7 +130,7 @@ struct SelectionEntry {
     replica_inbox: Option<ReplicaInbox>,
     affinity: OnceCell<SessionAffinity>,
     replica_config: Option<ReplicaSyncConfig>,
-    affinity_replication: Option<HostAffinityReplication>,
+    affinity_replication: Option<(u64, Arc<dyn super::affinity::AffinityReplicaSink>)>,
 }
 
 impl SelectionEntry {
@@ -146,8 +146,8 @@ impl SelectionEntry {
                     && let Some(sink) = config.affinity_sink(&self.key)
                 {
                     table.enable_replication(config.process_id(), sink);
-                } else if let Some(replication) = &self.affinity_replication {
-                    table.enable_replication(replication.writer_id, replication.sink(&self.key));
+                } else if let Some((writer_id, sink)) = &self.affinity_replication {
+                    table.enable_replication(*writer_id, sink.clone());
                 }
                 Ok(table)
             })?;
@@ -227,12 +227,14 @@ pub struct HostTelemetry {
     pub scheduler_load: Option<Arc<dyn SchedulerLoadSink>>,
 }
 
-/// Replica-sync transport carried by the host. Active-sequence channels are
-/// ignored when the service runs its own mesh; affinity requires one transport.
+/// Replica-sync transport the host carries for partitions this core does not
+/// mesh itself. Load channels are ignored when the service runs its own ZMQ
+/// replica sync; session bindings cannot be combined with it.
 #[derive(Clone)]
 pub struct HostReplication {
-    /// Session bindings exported independently of request-load replication.
-    pub affinity: Option<HostAffinityReplication>,
+    /// Identity and publisher for host-carried session bindings.
+    pub writer_id: u64,
+    pub affinity_tx: Option<mpsc::Sender<AffinityBindingEvent>>,
     pub channels: Option<HostReplicaSyncFactory>,
     /// Owns request expiry when supplied; the partition then expires only through lifecycle events.
     pub request_leases: Option<Arc<dyn ReplicaRequestLeaseObserver>>,
@@ -244,11 +246,42 @@ pub struct HostReplication {
 impl Default for HostReplication {
     fn default() -> Self {
         Self {
-            affinity: None,
+            writer_id: 0,
+            affinity_tx: None,
             channels: None,
             request_leases: None,
             replica_worker_policy: ReplicaWorkerPolicy::RequireRegistered,
         }
+    }
+}
+
+impl HostReplication {
+    pub fn affinity_channel(writer_id: u64) -> (Self, mpsc::Receiver<AffinityBindingEvent>) {
+        let (tx, rx) = mpsc::channel(AFFINITY_EVENT_CHANNEL_CAPACITY);
+        (
+            Self {
+                writer_id,
+                affinity_tx: Some(tx),
+                ..Self::default()
+            },
+            rx,
+        )
+    }
+
+    fn affinity_sink(
+        &self,
+        partition: &RoutingPartitionId,
+    ) -> Option<(u64, Arc<dyn super::affinity::AffinityReplicaSink>)> {
+        self.affinity_tx.clone().map(|tx| {
+            let sink = AffinityMeshSink {
+                partition: partition.clone(),
+                tx,
+            };
+            (
+                self.writer_id,
+                Arc::new(sink) as Arc<dyn super::affinity::AffinityReplicaSink>,
+            )
+        })
     }
 }
 
@@ -469,30 +502,27 @@ impl SelectionCore {
     }
 
     /// Apply a session binding a replica published.
-    pub(crate) fn dispatch_affinity_event(
-        &self,
-        event: AffinityBindingEvent,
-    ) -> ReplicaApplyOutcome {
+    pub(crate) fn dispatch_affinity_event(&self, event: AffinityBindingEvent) {
         let Some(entry) = self.entry(&event.partition) else {
             tracing::trace!(
                 key = %event.partition,
                 "Dropping session affinity replica update for unknown selector entry"
             );
-            return ReplicaApplyOutcome::UnknownPartition;
+            return;
         };
         let Some(table) = entry.affinity.get() else {
             tracing::trace!(
                 key = %event.partition,
                 "Dropping session affinity replica update: no affinity table"
             );
-            return ReplicaApplyOutcome::AffinityDisabled;
+            return;
         };
         if self
             .replica_config
             .as_ref()
             .is_some_and(|config| config.process_id() == event.writer_id)
         {
-            return ReplicaApplyOutcome::IgnoredSelf;
+            return;
         }
         table.observe_replica_sequence(event.sequence);
         if self
@@ -505,7 +535,7 @@ impl SelectionCore {
                 worker_id = event.worker_id,
                 "Dropping session affinity replica update: worker not in partition"
             );
-            return ReplicaApplyOutcome::UnknownWorker;
+            return;
         }
         let (target, version, worker_id) = (event.target(), event.version(), event.worker_id);
         let outcome = table.apply_replica_update(event.session_id, target, version);
@@ -514,7 +544,6 @@ impl SelectionCore {
             ?outcome,
             "Applied session affinity replica update"
         );
-        outcome
     }
 
     fn ready_entry(&self, key: &RoutingPartitionId) -> Result<Arc<SelectionEntry>, SelectionError> {

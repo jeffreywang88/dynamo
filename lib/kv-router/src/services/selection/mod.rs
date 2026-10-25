@@ -30,8 +30,8 @@ pub use crate::plugins::{
     WorkerSelectionPolicyRegistryError,
 };
 pub use crate::services::common::replica_sync::{
-    AffinityBindingEvent, HostAffinityReplication, HostReplicaChannels, HostReplicaSyncFactory,
-    ReplicaIngressObserver, ReplicaPeerError, SchedulerLoadSink,
+    AffinityBindingEvent, HostReplicaChannels, HostReplicaSyncFactory, ReplicaIngressObserver,
+    ReplicaPeerError, SchedulerLoadSink,
 };
 pub use core::{
     HostCache, HostEligibility, HostLoad, HostReplication, HostTelemetry, KvIndexSource, Selected,

@@ -302,10 +302,10 @@ async def session_binding_services(monkeypatch):
     peer = SelectionService(
         indexer_threads=1,
         session_affinity_ttl_secs=10,
+        session_affinity_mode="soft",
         session_replication_writer_id=22,
     )
     try:
-        # Give both services the same routing partition and worker catalog.
         for service in (source, peer):
             for worker_id in (1, 2):
                 await service.upsert_worker(
@@ -349,7 +349,7 @@ async def test_selection_service_session_binding_stream(session_binding_services
     assert "session_binding" not in selected
     binding = json.loads(json.dumps(await anext(stream)))
     assert binding["writer_id"] == 11
-    assert await peer.apply_session_binding(binding) == "inserted"
+    await peer.apply_session_binding(binding)
     await source.free_reservation("origin")
     assert await anext(stream) == binding  # A repeated version refreshes TTL.
     selected = await peer.select_and_reserve(
@@ -364,6 +364,18 @@ async def test_selection_service_session_binding_stream(session_binding_services
     assert (
         await anext(peer_stream) == binding
     )  # Local commits preserve imported versions.
+    # The default hard mode rejects an excluded binding; soft mode rebinds.
+    request = {
+        **partition,
+        "token_ids": [9, 10, 11, 12],
+        "selection_id": "excluded",
+        "session_id": "s",
+        "allowed_worker_ids": [2],
+    }
+    with pytest.raises(ValueError, match="session s is bound to worker 1, not 2"):
+        await source.select_and_reserve(request)
+    assert (await peer.select_and_reserve(request))["worker_id"] == 2
+    assert (await anext(peer_stream))["worker_id"] == 2
     await source.shutdown_async()
     with pytest.raises(StopAsyncIteration):
         await anext(stream)

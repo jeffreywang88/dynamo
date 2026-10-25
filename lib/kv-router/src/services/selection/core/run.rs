@@ -584,8 +584,9 @@ impl SelectionCore {
             match table.acquire(session_id, None).await {
                 Ok(Hold::Bound { target, mut lease })
                     if !self.catalog.is_schedulable(target, key)
-                        || allowed_worker_ids
-                            .is_some_and(|ids| !ids.contains(&target.worker_id)) =>
+                        || (table.mode() == SessionAffinityMode::Soft
+                            && allowed_worker_ids
+                                .is_some_and(|ids| !ids.contains(&target.worker_id))) =>
                 {
                     tracing::debug!(
                         session_id,

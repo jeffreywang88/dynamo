@@ -282,10 +282,10 @@ impl EmbeddedSelection {
                 })),
             },
             replication: HostReplication {
-                affinity: None,
                 channels: replica_sync,
                 request_leases,
                 replica_worker_policy: ReplicaWorkerPolicy::LazyRegister,
+                ..HostReplication::default()
             },
         })
         .build()

@@ -765,14 +765,17 @@ class SelectionService:
         replica_sync_peers: Optional[list[str]] = None,
         selection_cache: Optional[SelectionCacheConfig] = None,
         session_affinity_ttl_secs: Optional[float] = None,
+        session_affinity_mode: Literal["hard", "soft"] = "hard",
         session_replication_writer_id: Optional[int] = None,
     ) -> None:
         """Create a selection service. `indexer_threads` sizes the KV indexer pool.
 
         `session_affinity_ttl_secs` enables session affinity with an idle TTL
         between 1 and 31536000 seconds.
-        `session_replication_writer_id` exports bindings for a host-owned transport
-        instead of the built-in mesh; use an id unique to this replica incarnation.
+        `session_affinity_mode`: hard rejects dispatch away from a live binding;
+        soft rebinds when the bound worker is excluded from the request's candidates.
+        `session_replication_writer_id` exports affinity updates for a host transport;
+        use an id unique to this replica incarnation.
         """
         ...
 
@@ -791,22 +794,18 @@ class SelectionService:
         ...
 
     def session_binding_updates(self) -> AsyncIterator[JsonLike]:
-        """Take the single-consumer, bounded, best-effort binding stream.
+        """Stream session bindings this service commits or refreshes, for the
+        host to broadcast to its peers.
 
-        Requires session_replication_writer_id. Carries commit updates and
-        release-time TTL refreshes, including repeated versions. Importing a
-        peer update does not echo it. Iteration ends on service shutdown.
-        Peers refresh their idle TTL on receipt; remote active leases are not carried.
+        Requires session_replication_writer_id. Ends on shutdown.
         """
         ...
 
-    async def apply_session_binding(self, binding: JsonLike) -> str:
-        """Apply a peer binding independently of request load; return its outcome.
+    async def apply_session_binding(self, update: JsonLike) -> None:
+        """Merge a versioned peer binding without echoing it.
 
-        Outcomes: inserted, refreshed, replaced_expired, replaced_newer,
-        ignored_initializing, ignored_conflict, rejected_session_id,
-        rejected_capacity, unknown_partition, affinity_disabled, unknown_worker,
-        ignored_self. Unknown partition/worker and initialization can be retried.
+        A binding this replica cannot place yet is dropped; the owner's next
+        refresh repairs it.
         """
         ...
 

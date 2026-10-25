@@ -660,7 +660,7 @@ pub(crate) struct SelectionService {
 #[cfg(feature = "select-service")]
 #[pyclass]
 pub(crate) struct SessionBindingStream {
-    updates: Arc<tokio::sync::Mutex<selection::SessionBindingUpdates>>,
+    updates: Arc<selection::SessionBindingUpdates>,
 }
 
 #[cfg(feature = "select-service")]
@@ -673,7 +673,7 @@ impl SessionBindingStream {
     fn __anext__<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let updates = self.updates.clone();
         crate::future_into_py(py, async move {
-            let event = updates.lock().await.recv().await.ok_or_else(|| {
+            let event = updates.recv().await.ok_or_else(|| {
                 pyo3::exceptions::PyStopAsyncIteration::new_err("selection service shut down")
             })?;
             Python::with_gil(|py| pythonize(py, &event).map(|o| o.unbind()).map_err(to_pyerr))
@@ -686,7 +686,7 @@ impl SessionBindingStream {
 impl SelectionService {
     /// Create a selection service. `indexer_threads` sizes the KV indexer pool.
     #[new]
-    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None, session_affinity_ttl_secs = None, session_replication_writer_id = None))]
+    #[pyo3(signature = (*, indexer_threads = 4, indexer_peers = None, replica_sync_port = None, replica_sync_peers = None, selection_cache = None, session_affinity_ttl_secs = None, session_affinity_mode = "hard", session_replication_writer_id = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -696,8 +696,12 @@ impl SelectionService {
         replica_sync_peers: Option<Vec<String>>,
         selection_cache: Option<SelectionCacheConfig>,
         session_affinity_ttl_secs: Option<f64>,
+        session_affinity_mode: &str,
         session_replication_writer_id: Option<u64>,
     ) -> PyResult<Self> {
+        let session_affinity_mode = session_affinity_mode
+            .parse::<RsSessionAffinityMode>()
+            .map_err(PyValueError::new_err)?;
         let replica_sync_peers = replica_sync_peers.unwrap_or_default();
         if replica_sync_port.is_none() && !replica_sync_peers.is_empty() {
             return Err(PyValueError::new_err(
@@ -715,7 +719,8 @@ impl SelectionService {
         )
         .indexer_threads(indexer_threads)
         .indexer_peers(indexer_peers.unwrap_or_default())
-        .selection_cache(selection_cache.unwrap_or_default().inner);
+        .selection_cache(selection_cache.unwrap_or_default().inner)
+        .session_affinity_mode(session_affinity_mode);
         if let Some(port) = replica_sync_port {
             builder = builder.replica_sync(port, replica_sync_peers);
         }
@@ -745,34 +750,30 @@ impl SelectionService {
         py.allow_threads(|| crate::bridge_runtime().block_on(service.shutdown()));
     }
 
-    /// Take the bounded, best-effort binding stream. May only be taken once.
+    /// Session bindings this replica commits or refreshes, for the host to
+    /// broadcast to its peers. Ends when the service shuts down.
     fn session_binding_updates(&self) -> PyResult<SessionBindingStream> {
         Ok(SessionBindingStream {
-            updates: Arc::new(tokio::sync::Mutex::new(
+            updates: Arc::new(
                 self.inner
-                    .take_session_binding_updates()
+                    .session_binding_updates()
                     .map_err(selection_to_pyerr)?,
-            )),
+            ),
         })
     }
 
     fn apply_session_binding<'p>(
         &self,
         py: Python<'p>,
-        binding: PyObject,
+        update: PyObject,
     ) -> PyResult<Bound<'p, PyAny>> {
         let event: selection::AffinityBindingEvent =
-            depythonize(binding.bind(py)).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            depythonize(update.bind(py)).map_err(|e| PyValueError::new_err(e.to_string()))?;
         let service = self.inner.clone();
         crate::future_into_py(py, async move {
-            let outcome = service
+            service
                 .apply_session_binding(event)
-                .map_err(selection_to_pyerr)?;
-            Python::with_gil(|py| {
-                pythonize(py, &outcome)
-                    .map(|o| o.unbind())
-                    .map_err(to_pyerr)
-            })
+                .map_err(selection_to_pyerr)
         })
     }
 
