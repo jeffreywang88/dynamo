@@ -35,4 +35,5 @@ pub mod model_card;
 pub mod pool_relay;
 pub mod preprocessor;
 pub mod replay;
+pub mod mocker_worker;
 pub mod routed_engine;
