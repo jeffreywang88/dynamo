@@ -35,4 +35,5 @@ pub mod lora;
 pub mod model_card;
 pub mod preprocessor;
 pub mod replay;
+pub mod mocker_worker;
 pub mod routed_engine;

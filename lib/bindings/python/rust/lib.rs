@@ -425,6 +425,8 @@ fn register_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<llm::kv_state_agent::KvStateAgentHost>()?;
     m.add_class::<llm::kv_state_agent::KvStateAttachmentOwner>()?;
     m.add_class::<llm::routed_engine::RoutedEngine>()?;
+    m.add_class::<llm::mocker_worker::MockerWorker>()?;
+    m.add_class::<llm::mocker_worker::MockerRequest>()?;
     m.add_class::<RouterMode>()?;
     m.add_class::<kserve_grpc::KserveGrpcService>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
