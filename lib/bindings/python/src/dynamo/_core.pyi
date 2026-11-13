@@ -897,6 +897,23 @@ class SelectionService:
         """Per-worker potential loads for a prompt, without booking."""
         ...
 
+    async def register_worker_publisher(self, endpoint: str) -> bool:
+        """Subscribe to a worker that publishes its own requests' prefill-completed
+        and free events (requires replica sync).
+
+        They apply to this service's booking, local or replicated, and are not
+        republished. Returns whether membership changed.
+        """
+        ...
+
+    async def deregister_worker_publisher(self, endpoint: str) -> bool:
+        """Unsubscribe from a worker publisher. Returns whether membership changed."""
+        ...
+
+    def list_worker_publishers(self) -> list[str]:
+        """Endpoints of the subscribed worker publishers, sorted."""
+        ...
+
 class ModelDeploymentCard:
     """
     A model deployment card is a collection of model information

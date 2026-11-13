@@ -1947,6 +1947,131 @@ async fn selector_replica_sync_propagates_request_lifecycle() {
     service_b.shutdown().await;
 }
 
+async fn mesh_service(port: u16) -> SelectionService {
+    SelectionServiceBuilder::new(
+        test_config(),
+        dynamo_router_protocol::WorkerType::Aggregated,
+        RouterPluginRegistry::default().with_default_factory(Arc::new(|config, role, _| {
+            dynamo_worker_selection::WorkerSelectionPolicy::reference(
+                config.clone(),
+                role.default_selector_label(),
+            )
+        })),
+    )
+    .indexer_threads(1)
+    .replica_sync(port, Vec::new())
+    .build()
+    .await
+    .unwrap()
+}
+
+/// An event worker 1 publishes about its own request.
+fn worker_event_frames(request_id: &str, data: &str) -> Vec<Vec<u8>> {
+    let event = serde_json::json!({
+        "model_name": "model",
+        "routing_group": "default",
+        "block_size": 4,
+        "event": {
+            "request_id": request_id,
+            "worker": {"worker_id": 1, "dp_rank": 0},
+            "data": data,
+            "router_id": 1,
+            "lora_name": null,
+        },
+    });
+    vec![
+        crate::services::common::replica_sync::REPLICA_TOPIC.to_vec(),
+        rmp_serde::to_vec_named(&event).unwrap(),
+    ]
+}
+
+fn service_load(service: &SelectionService) -> (usize, usize, usize) {
+    let loads = service.loads(Some("model"), Some("default"));
+    let load = &loads[0].loads[0];
+    (
+        load.active_requests,
+        load.potential_decode_blocks,
+        load.potential_prefill_tokens,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_events_reach_every_selector_after_the_booking_one_leaves() {
+    let port_a = reserve_tcp_port();
+    let service_a = mesh_service(port_a).await;
+    let service_b = mesh_service(reserve_tcp_port()).await;
+    service_b
+        .register_replica_peer(format!("tcp://127.0.0.1:{port_a}"))
+        .await
+        .unwrap();
+    let worker_endpoint = format!("tcp://127.0.0.1:{}", reserve_tcp_port());
+    let mut worker =
+        crate::services::common::zmq::create_bound_pub_socket(&worker_endpoint).unwrap();
+    for service in [&service_a, &service_b] {
+        let worker: WorkerRequest = serde_json::from_value(serde_json::json!({
+            "worker_id": 1,
+            "model_name": "model",
+            "endpoint": "http://worker-1:8000",
+            "block_size": 4
+        }))
+        .unwrap();
+        service.upsert_worker(worker).await.unwrap();
+        assert!(
+            service
+                .register_worker_publisher(worker_endpoint.clone())
+                .await
+                .unwrap()
+        );
+    }
+    // Distinct prompts, so neither reuses a recorded routing decision.
+    let reserve = |selection_id: &str, token_ids: [u32; 4]| -> SelectAndReserveRequest {
+        serde_json::from_value(serde_json::json!({
+            "model_name": "model",
+            "token_ids": token_ids,
+            "selection_id": selection_id,
+        }))
+        .unwrap()
+    };
+
+    // Subscriptions connect asynchronously: resend the free until both apply it.
+    service_a
+        .select_and_reserve(reserve("warmup", [1, 2, 3, 4]))
+        .await
+        .unwrap();
+    wait_for_service_load(&service_b, 1, 1, 4).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service_load(&service_a) != (0, 0, 0) || service_load(&service_b) != (0, 0, 0) {
+            worker
+                .send_multipart(worker_event_frames("warmup", "Free"))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("worker free never reached both selectors");
+
+    service_a
+        .select_and_reserve(reserve("target", [5, 6, 7, 8]))
+        .await
+        .unwrap();
+    wait_for_service_load(&service_b, 1, 1, 4).await;
+    service_a.shutdown().await;
+    drop(service_a);
+
+    worker
+        .send_multipart(worker_event_frames("target", "MarkPrefillCompleted"))
+        .await
+        .unwrap();
+    wait_for_service_load(&service_b, 1, 1, 0).await;
+    worker
+        .send_multipart(worker_event_frames("target", "Free"))
+        .await
+        .unwrap();
+    wait_for_service_load(&service_b, 0, 0, 0).await;
+    service_b.shutdown().await;
+}
+
 async fn wait_for_service_load(
     service: &SelectionService,
     expected_requests: usize,

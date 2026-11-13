@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::task::Poll;
 
 use rustc_hash::FxHashMap;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::multi_worker::{
@@ -19,6 +20,74 @@ use crate::prelude::{
     ActiveSequenceEvent, ActiveSequenceEventData, MAX_REPLICA_BATCH_DURATION,
     MAX_REPLICA_BATCH_EVENTS, WorkerWithDpRank,
 };
+
+/// How long an early worker mark waits for its replicated booking.
+const EARLY_WORKER_MARK_TTL: Duration = Duration::from_secs(30);
+/// Most early worker marks kept; the oldest are dropped first.
+const EARLY_WORKER_MARK_CAPACITY: usize = 65_536;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EarlyWorkerMark {
+    PrefillCompleted,
+    Freed,
+}
+
+/// Worker events for requests not booked here yet.
+///
+/// Workers publish to every router directly, so their events can overtake the
+/// replicated `AddRequest`. The booking takes the mark when it arrives: a freed
+/// request is not booked, and a prefill-completed one is booked as decoding.
+#[derive(Default)]
+pub(super) struct EarlyWorkerMarks {
+    marks: FxHashMap<String, (WorkerWithDpRank, EarlyWorkerMark, Instant)>,
+    /// Recording order, for expiry. May hold ids already taken.
+    order: VecDeque<(Instant, String)>,
+}
+
+impl EarlyWorkerMarks {
+    fn record(
+        &mut self,
+        request_id: String,
+        worker: WorkerWithDpRank,
+        mark: EarlyWorkerMark,
+        now: Instant,
+    ) {
+        while let Some((recorded_at, _)) = self.order.front()
+            && (now.duration_since(*recorded_at) >= EARLY_WORKER_MARK_TTL
+                || self.order.len() >= EARLY_WORKER_MARK_CAPACITY)
+        {
+            let (recorded_at, request_id) = self.order.pop_front().unwrap();
+            if self
+                .marks
+                .get(&request_id)
+                .is_some_and(|(_, _, at)| *at == recorded_at)
+            {
+                self.marks.remove(&request_id);
+            }
+        }
+        match self.marks.get_mut(&request_id) {
+            // A free supersedes an earlier prefill mark for the same booking.
+            Some(existing) if existing.0 == worker => {
+                if mark == EarlyWorkerMark::Freed {
+                    existing.1 = mark;
+                }
+            }
+            _ => {
+                self.order.push_back((now, request_id.clone()));
+                self.marks.insert(request_id, (worker, mark, now));
+            }
+        }
+    }
+
+    /// Take the mark a booking of `request_id` on `worker` must honor.
+    fn take(&mut self, request_id: &str, worker: WorkerWithDpRank) -> Option<EarlyWorkerMark> {
+        if self.marks.is_empty() {
+            return None;
+        }
+        let (marked_worker, mark, _) = self.marks.remove(request_id)?;
+        (marked_worker == worker).then_some(mark)
+    }
+}
 
 #[derive(Default)]
 struct ReplicaBatchEffects {
@@ -172,6 +241,8 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
         if !self.replica_sync && !matches!(data, ActiveSequenceEventData::MarkPrefillCompleted) {
             return;
         }
+        // Workers stamp their own id as `router_id`.
+        let remember_early_mark = self.replica_sync && router_id == event_worker.worker_id;
 
         // ActiveSequenceEvent does not carry prompt-load decay timestamps yet.
         // Peer routers still approximate decay anchoring with local receive time.
@@ -184,6 +255,13 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 expected_output_tokens,
                 prefill_load_hint,
             } => {
+                let early_mark = self
+                    .early_worker_marks
+                    .lock()
+                    .take(&request_id, event_worker);
+                if early_mark == Some(EarlyWorkerMark::Freed) {
+                    return;
+                }
                 let Ok(attempt_id) = self.request_index.try_insert_request(
                     request_id.clone(),
                     event_worker,
@@ -235,14 +313,33 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
                 drop(table);
                 self.request_index
                     .remove_requests(expired_request_ids.iter());
+                let early_prefill_mark = (early_mark == Some(EarlyWorkerMark::PrefillCompleted))
+                    .then(|| ActiveSequenceEvent {
+                        request_id: booking.request_id.clone(),
+                        worker: event_worker,
+                        data: ActiveSequenceEventData::MarkPrefillCompleted,
+                        router_id,
+                        lora_name: None,
+                    });
                 if let Some(observer) = self.replica_request_lease_observer() {
                     observer.admitted(booking);
                 }
                 effects.record_worker_load(event_worker, load, true);
                 effects.cleanup_prompt_trie = true;
+                if let Some(mark) = early_prefill_mark {
+                    self.apply_replica_event(mark, effects);
+                }
             }
             ActiveSequenceEventData::Free => {
                 let Some(current) = self.request_index.booking_for(&request_id) else {
+                    if remember_early_mark {
+                        self.early_worker_marks.lock().record(
+                            request_id,
+                            event_worker,
+                            EarlyWorkerMark::Freed,
+                            decay_now,
+                        );
+                    }
                     return;
                 };
                 if current.worker != event_worker {
@@ -287,6 +384,14 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             }
             ActiveSequenceEventData::MarkPrefillCompleted => {
                 let Some(current) = self.request_index.booking_for(&request_id) else {
+                    if remember_early_mark {
+                        self.early_worker_marks.lock().record(
+                            request_id,
+                            event_worker,
+                            EarlyWorkerMark::PrefillCompleted,
+                            decay_now,
+                        );
+                    }
                     return;
                 };
                 if current.worker != event_worker {

@@ -733,6 +733,43 @@ impl SelectionService {
             .unwrap_or_default()
     }
 
+    /// Subscribe to a worker that publishes its own requests' prefill-completed and free
+    /// events as [`ScopedReplicaEvent`](dynamo_scheduler::replication::ScopedReplicaEvent)s
+    /// on the replica topic, with its worker id as `router_id`. They apply to this
+    /// service's booking, local or replicated, and are not republished. Requires replica
+    /// sync. Returns whether membership changed.
+    #[cfg(feature = "replica-sync-zmq")]
+    pub async fn register_worker_publisher(
+        &self,
+        endpoint: String,
+    ) -> Result<bool, ReplicaPeerError> {
+        let peer_manager = self
+            .peer_manager
+            .as_ref()
+            .ok_or(ReplicaPeerError::Disabled)?;
+        peer_manager.register_worker_publisher(endpoint).await
+    }
+
+    #[cfg(feature = "replica-sync-zmq")]
+    pub async fn deregister_worker_publisher(
+        &self,
+        endpoint: String,
+    ) -> Result<bool, ReplicaPeerError> {
+        let peer_manager = self
+            .peer_manager
+            .as_ref()
+            .ok_or(ReplicaPeerError::Disabled)?;
+        peer_manager.deregister_worker_publisher(endpoint).await
+    }
+
+    #[cfg(feature = "replica-sync-zmq")]
+    pub fn list_worker_publishers(&self) -> Vec<String> {
+        self.peer_manager
+            .as_ref()
+            .map(|peer_manager| peer_manager.list_worker_publishers())
+            .unwrap_or_default()
+    }
+
     // Only the HTTP server's replica-peer routes read it.
     #[cfg(all(
         feature = "http",

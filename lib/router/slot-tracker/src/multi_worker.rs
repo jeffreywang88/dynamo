@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::prefill_tracker::PrefillTimeLoad;
 use super::prompt_registry::{PromptRegistry, WorkerLoadReader, WorkerLoadSnapshot};
+use super::replica_sync::EarlyWorkerMarks;
 use super::request_maps::{RequestBooking, RequestIndex};
 use super::sharded_lock::ShardedRwLock;
 use super::single::{
@@ -388,6 +389,7 @@ pub struct ActiveSequencesMultiWorker<P: SequencePublisher> {
     pub(super) replica_sync: bool,
     pub(super) replica_worker_policy: ReplicaWorkerPolicy,
     replica_request_lease_observer: OnceLock<Arc<dyn ReplicaRequestLeaseObserver>>,
+    pub(super) early_worker_marks: Mutex<EarlyWorkerMarks>,
     worker_type: &'static str,
 }
 
@@ -498,6 +500,7 @@ impl<P: SequencePublisher + 'static> ActiveSequencesMultiWorker<P> {
             replica_sync,
             replica_worker_policy: options.replica_worker_policy,
             replica_request_lease_observer: OnceLock::new(),
+            early_worker_marks: Mutex::default(),
             worker_type,
         }
     }
@@ -3580,6 +3583,67 @@ mod tests {
             cleanup_count + 1
         );
         assert_eq!(sequences.request_index.worker_for("req-1"), None);
+    }
+
+    /// `event` as its worker publishes it.
+    fn from_worker(mut event: ActiveSequenceEvent) -> ActiveSequenceEvent {
+        event.router_id = event.worker.worker_id;
+        event
+    }
+
+    fn load_of(
+        sequences: &ActiveSequencesMultiWorker<RecordingPublisher>,
+        worker: WorkerWithDpRank,
+    ) -> (usize, usize, usize) {
+        let now = Instant::now();
+        (
+            sequences.active_request_counts()[&worker],
+            sequences.active_blocks()[&worker],
+            sequences.active_tokens(now)[&worker],
+        )
+    }
+
+    #[test]
+    fn worker_events_before_the_replica_booking() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let other_worker = WorkerWithDpRank::new(2, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1)), (2, (0, 1))]));
+
+        sequences.apply_replica_batch(vec![
+            from_worker(replica_free("freed", worker)),
+            from_worker(replica_mark("prefilled", worker)),
+            // Only a worker's own events, for its own requests, are held.
+            replica_free("router-freed", worker),
+            from_worker(replica_free("other-worker", other_worker)),
+        ]);
+        sequences.apply_replica_batch(vec![
+            replica_add("freed", worker, vec![1, 2, 3]),
+            replica_add("prefilled", worker, vec![4, 5, 6]),
+            replica_add("router-freed", worker, vec![7, 8, 9]),
+            replica_add("other-worker", worker, vec![10, 11, 12]),
+        ]);
+
+        assert_eq!(sequences.request_index.worker_for("freed"), None);
+        // "prefilled" books decoding; the other two book prefill load.
+        assert_eq!(load_of(&sequences, worker), (3, 9, 24));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_worker_marks_expire() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let (sequences, _) = make_recording_sequences(HashMap::from([(1, (0, 1))]));
+
+        sequences.apply_replica_batch(vec![from_worker(replica_free("stale", worker))]);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        // Recording another mark sweeps the expired one.
+        sequences.apply_replica_batch(vec![from_worker(replica_free("fresh", worker))]);
+        sequences.apply_replica_batch(vec![
+            replica_add("stale", worker, vec![1, 2, 3]),
+            replica_add("fresh", worker, vec![4, 5, 6]),
+        ]);
+
+        assert_eq!(sequences.request_index.worker_for("stale"), Some(worker));
+        assert_eq!(sequences.request_index.worker_for("fresh"), None);
     }
 
     #[tokio::test(start_paused = true)]

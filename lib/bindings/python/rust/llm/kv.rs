@@ -1068,6 +1068,41 @@ impl SelectionService {
         self.inner.list_replica_peers()
     }
 
+    /// Subscribe to a worker's request-event publisher. Returns whether membership changed.
+    fn register_worker_publisher<'p>(
+        &self,
+        py: Python<'p>,
+        endpoint: String,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let service = Arc::clone(&self.inner);
+        crate::future_into_py(py, async move {
+            service
+                .register_worker_publisher(endpoint)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Unsubscribe from a worker's request-event publisher. Returns whether membership changed.
+    fn deregister_worker_publisher<'p>(
+        &self,
+        py: Python<'p>,
+        endpoint: String,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let service = Arc::clone(&self.inner);
+        crate::future_into_py(py, async move {
+            service
+                .deregister_worker_publisher(endpoint)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// List subscribed worker publishers.
+    fn list_worker_publishers(&self) -> Vec<String> {
+        self.inner.list_worker_publishers()
+    }
+
     /// Export the current indexer state in the standalone `/dump` shape.
     fn indexer_snapshot<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let service = Arc::clone(&self.inner);
